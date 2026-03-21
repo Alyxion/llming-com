@@ -10,13 +10,13 @@ from llming_com import BaseSessionEntry, BaseSessionRegistry, make_auth_cookie_v
 
 
 @dataclass
-class ChatEntry(BaseSessionEntry):
+class ChatSession(BaseSessionEntry):
     """Session entry with a model field."""
     model: str = "gpt-4o"
     language: str = "en"
 
 
-class ChatRegistry(BaseSessionRegistry["ChatEntry"]):
+class ChatRegistry(BaseSessionRegistry["ChatSession"]):
     """Application-level session registry."""
 
     def on_session_expired(self, session_id, entry):
@@ -30,8 +30,8 @@ def main():
     sid1, token1 = make_auth_cookie_value()
     sid2, token2 = make_auth_cookie_value()
 
-    registry.register(sid1, ChatEntry(user_id="alice", model="claude-sonnet", language="de"))
-    registry.register(sid2, ChatEntry(user_id="bob", model="gpt-4o", language="en"))
+    registry.register(sid1, ChatSession(user_id="alice", model="claude-sonnet", language="de"))
+    registry.register(sid2, ChatSession(user_id="bob", model="gpt-4o", language="en"))
 
     print(f"Active sessions: {registry.active_count}")
 

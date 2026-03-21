@@ -97,16 +97,16 @@ from dataclasses import dataclass
 from llming_com import BaseSessionEntry, BaseSessionRegistry, make_auth_cookie_value
 
 @dataclass
-class ChatEntry(BaseSessionEntry):
+class ChatSession(BaseSessionEntry):
     model: str = "gpt-4o"
 
-class ChatRegistry(BaseSessionRegistry["ChatEntry"]):
+class ChatRegistry(BaseSessionRegistry["ChatSession"]):
     pass
 
 # Create a session
 session_id, token = make_auth_cookie_value()
 registry = ChatRegistry.get()
-entry = ChatEntry(user_id="user-42", model="claude-sonnet")
+entry = ChatSession(user_id="user-42", model="claude-sonnet")
 registry.register(session_id, entry)
 
 # Look up later
