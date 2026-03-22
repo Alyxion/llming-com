@@ -35,6 +35,7 @@ class BaseSessionEntry:
     user_name: str = ""
     user_email: str = ""
     user_avatar: str = ""
+    app_type: str = ""  # App identifier for command filtering (e.g. "lodge", "hub")
     websocket: Optional[Any] = None  # WebSocket from starlette
     controller: Optional[Any] = None
     created_at: float = field(default_factory=time.monotonic)

@@ -22,6 +22,15 @@ from llming_com.auth import (
     verify_auth_cookie,
     verify_identity_cookie,
 )
+from llming_com.command import (
+    command,
+    CommandDef,
+    CommandError,
+    CommandRegistry,
+    CommandScope,
+    get_default_command_registry,
+)
+from llming_com.command_router import build_command_router
 from llming_com.controller import BaseController
 from llming_com.data_store import SessionDataStore
 from llming_com.debug import build_debug_router
@@ -48,6 +57,14 @@ __all__ = [
     "BaseController",
     # Debug
     "build_debug_router",
+    # Commands
+    "command",
+    "CommandDef",
+    "CommandError",
+    "CommandRegistry",
+    "CommandScope",
+    "get_default_command_registry",
+    "build_command_router",
     # DataStore
     "SessionDataStore",
 ]
