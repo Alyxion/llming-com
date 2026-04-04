@@ -2,27 +2,51 @@
 
 Call ``build_command_router()`` to create an ``APIRouter`` where every
 registered command becomes a REST endpoint.
+
+CSRF note: This router is designed for use behind cookie-based auth.
+When deployed with ``SameSite=Lax`` cookies (the default), the browser
+will not send cookies on cross-origin POST requests, which provides
+baseline CSRF protection. For additional safety, callers can add a
+custom CSRF token header check via ``auth_dependency``.
 """
 
 from __future__ import annotations
 
+import enum
 import inspect
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from llming_com.auth import get_auth_session_id
 from llming_com.command import (
     CommandDef,
     CommandError,
     CommandRegistry,
     CommandScope,
-    INJECTED_PARAMS,
     get_default_command_registry,
 )
 from llming_com.session import BaseSessionRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_param(value: Any, target_type: type) -> Any:
+    """Basic parameter type coercion from query string values."""
+    if value is None:
+        return value
+    if target_type is int:
+        return int(value)
+    if target_type is float:
+        return float(value)
+    if target_type is bool:
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes")
+        return bool(value)
+    if target_type is str:
+        return str(value)
+    return value
 
 
 def build_command_router(
@@ -70,6 +94,9 @@ def _mount_command(
 ) -> None:
     """Mount a single command as a FastAPI route."""
 
+    # Build a type map for parameter coercion
+    _param_types: dict[str, type] = {p.name: p.type for p in cmd.params}
+
     # Determine URL path
     if cmd.http_path:
         path = cmd.http_path
@@ -88,11 +115,17 @@ def _mount_command(
                 if not session_id:
                     raise HTTPException(400, "session_id required")
                 # Resolve "current" to the most recently active session
+                # scoped to the authenticated user
                 if session_id == "current":
+                    auth_sid = get_auth_session_id(request)
                     sessions = session_registry.list_sessions()
                     if not sessions:
                         raise HTTPException(404, "No active sessions")
-                    session_id = max(sessions, key=lambda sid: sessions[sid].last_activity)
+                    # If we have an authenticated user, prefer their session
+                    candidates = sessions
+                    if auth_sid and auth_sid in sessions:
+                        candidates = {auth_sid: sessions[auth_sid]}
+                    session_id = max(candidates, key=lambda sid: candidates[sid].last_activity)
                 entry = session_registry.get_session(session_id)
                 if not entry:
                     raise HTTPException(404, f"Session {session_id} not found")
@@ -116,6 +149,14 @@ def _mount_command(
                 if qval is not None:
                     user_params[p.name] = qval
 
+            # Apply type coercion for query params
+            for pname, pval in user_params.items():
+                if pname in _param_types and isinstance(pval, str):
+                    try:
+                        user_params[pname] = _coerce_param(pval, _param_types[pname])
+                    except (ValueError, TypeError):
+                        pass
+
             # Build call kwargs from signature
             sig = inspect.signature(cmd.handler)
             call_kwargs: dict[str, Any] = {}
@@ -133,4 +174,4 @@ def _mount_command(
     # Register with the appropriate HTTP method
     method_map = {"GET": router.get, "POST": router.post, "PUT": router.put, "DELETE": router.delete}
     register = method_map.get(cmd.http_method, router.post)
-    register(path, tags=cmd.tags or None, summary=cmd.description)(_handler)
+    register(path, tags=cast(list[str | enum.Enum] | None, cmd.tags or None), summary=cmd.description)(_handler)

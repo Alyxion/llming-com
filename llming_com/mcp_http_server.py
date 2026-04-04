@@ -1,7 +1,7 @@
 """HTTP/SSE MCP server mounted on a FastAPI/Starlette app.
 
 Serves the command registry as MCP tools over HTTP/SSE transport.
-Commands are resolved in-process — direct session/controller access.
+Commands are resolved in-process -- direct session/controller access.
 
 Usage::
 
@@ -12,6 +12,7 @@ Usage::
 
 from __future__ import annotations
 
+import hmac
 import inspect
 import json
 import logging
@@ -21,7 +22,6 @@ from llming_com.command import (
     CommandError,
     CommandRegistry,
     CommandScope,
-    INJECTED_PARAMS,
     get_default_command_registry,
 )
 from llming_com.session import BaseSessionRegistry
@@ -36,6 +36,7 @@ def mount_mcp_server(
     command_registry: Optional[CommandRegistry] = None,
     prefix: str = "/mcp",
     extras: Optional[dict] = None,
+    api_key: Optional[str] = None,
 ) -> None:
     """Mount an MCP HTTP/SSE server on a FastAPI/Starlette app.
 
@@ -45,6 +46,8 @@ def mount_mcp_server(
         command_registry: Command registry (default: global).
         prefix: URL prefix for MCP endpoints.
         extras: Extra injectable values.
+        api_key: Optional API key. When set, requests must include an
+            ``x-mcp-key`` header with a matching value.
     """
     from mcp.server import Server
     from mcp.server.sse import SseServerTransport
@@ -115,16 +118,22 @@ def mount_mcp_server(
 
         except CommandError as e:
             return [TextContent(type="text", text=json.dumps({"error": e.detail, "status": e.status_code}))]
-        except Exception as e:
+        except Exception:
             logger.exception("Command %s failed", name)
-            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            return [TextContent(type="text", text=json.dumps({"error": "Internal server error"}))]
 
     # Mount SSE transport on the app
     sse = SseServerTransport(f"{prefix}/messages/")
 
+    from starlette.responses import Response
     from starlette.routing import Mount, Route
 
     async def handle_sse(request):
+        # API key check
+        if api_key:
+            provided = request.headers.get("x-mcp-key", "")
+            if not hmac.compare_digest(provided, api_key):
+                return Response("Unauthorized", status_code=401)
         async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
             await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
 

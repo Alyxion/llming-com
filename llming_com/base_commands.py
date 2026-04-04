@@ -17,7 +17,7 @@ async def list_sessions(registry):
     sessions = []
     for sid, entry in registry.list_sessions().items():
         sessions.append({
-            "session_id": sid,
+            "session_id": sid[:8] + "(truncated)" if len(sid) > 8 else sid,
             "user_id": entry.user_id,
             "user_name": entry.user_name,
             "user_email": entry.user_email,

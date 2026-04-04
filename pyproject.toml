@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "llming-com"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reusable WebSocket session management, auth, and debug API for llming applications"
 authors = ["Michael Ikemann"]
 license = "MIT"
@@ -13,7 +13,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Software Development :: Libraries",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
 ]
 packages = [{include = "llming_com"}]
 
@@ -21,7 +21,7 @@ packages = [{include = "llming_com"}]
 "Author" = "https://github.com/Alyxion"
 
 [tool.poetry.dependencies]
-python = ">=3.12"
+python = ">=3.14"
 starlette = ">=0.27"
 fastapi = ">=0.100"
 

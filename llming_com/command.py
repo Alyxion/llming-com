@@ -208,7 +208,7 @@ def command(
         )
         target = registry or _default_registry
         target.register(cmd)
-        fn._command_def = cmd
+        setattr(fn, "_command_def", cmd)
         return fn
 
     return decorator

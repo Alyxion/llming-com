@@ -1,10 +1,10 @@
 """Base debug API router for llming applications.
 
-Provides ``build_debug_router`` — creates FastAPI endpoints for inspecting
+Provides ``build_debug_router`` -- creates FastAPI endpoints for inspecting
 and controlling active sessions. Applications extend with domain-specific
 endpoints via the ``extra_routes`` hook.
 
-Protected by API key (header or query param) + optional IP whitelist.
+Protected by API key (header only) + optional IP whitelist.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import ipaddress
 import logging
 import os
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def _default_session_detail(session_id: str, entry: BaseSessionEntry) -> dict:
-    """Default session detail — override via session_detail_hook."""
+    """Default session detail -- override via session_detail_hook."""
     return {}
 
 
@@ -34,6 +34,8 @@ def build_debug_router(
     api_key_env: str = "DEBUG_API_KEY",
     prefix: str = "/debug",
     allowed_networks: list[str] | None = None,
+    trusted_proxies: list[str] | None = None,
+    allowed_message_types: list[str] | None = None,
     session_detail_hook: Optional[
         Callable[[str, BaseSessionEntry], dict | Awaitable[dict]]
     ] = None,
@@ -42,9 +44,9 @@ def build_debug_router(
     """Build a debug API router with session inspection endpoints.
 
     Provides:
-        GET  {prefix}/sessions              — list all sessions
-        GET  {prefix}/sessions/{id}         — session detail
-        POST {prefix}/sessions/{id}/ws_send — forward a JSON message via WS
+        GET  {prefix}/sessions              -- list all sessions
+        GET  {prefix}/sessions/{id}         -- session detail
+        POST {prefix}/sessions/{id}/ws_send -- forward a JSON message via WS
 
     Args:
         registry: The session registry to inspect.
@@ -52,6 +54,10 @@ def build_debug_router(
         prefix: URL prefix for all debug endpoints.
         allowed_networks: IP whitelist (CIDR notation). If None, allows
             127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16.
+        trusted_proxies: IP addresses of trusted reverse proxies. When set,
+            X-Forwarded-For is used to determine the real client IP.
+        allowed_message_types: If set, only these message types can be
+            forwarded via ws_send. None means all types allowed.
         session_detail_hook: Called with (session_id, entry) to add
             domain-specific fields to the session detail response.
             Can be sync or async.
@@ -63,6 +69,19 @@ def build_debug_router(
 
     _skip_ip_check = "*" in allowed_networks
     _allowed = [] if _skip_ip_check else [ipaddress.ip_network(n) for n in allowed_networks]
+    _trusted_proxies = set(trusted_proxies) if trusted_proxies else set()
+
+    def _resolve_client_ip(request: Request) -> str | None:
+        """Resolve client IP, respecting trusted proxies."""
+        direct_ip = request.client.host if request.client else None
+
+        if _trusted_proxies and direct_ip in _trusted_proxies:
+            forwarded = request.headers.get("x-forwarded-for", "")
+            if forwarded:
+                # Take the first IP in the chain (original client)
+                return forwarded.split(",")[0].strip()
+
+        return direct_ip
 
     def _check_auth(request: Request) -> None:
         """Verify API key and IP whitelist."""
@@ -70,17 +89,17 @@ def build_debug_router(
         if not api_key:
             raise HTTPException(403, "Debug API not configured")
 
-        # Check API key from header or query param
-        provided = (
-            request.headers.get("x-debug-key")
-            or request.query_params.get("key")
-            or ""
-        )
+        # Only accept API key from header (not query params)
+        provided = request.headers.get("x-debug-key") or ""
         if not hmac.compare_digest(provided, api_key):
             raise HTTPException(401, "Invalid API key")
 
+        # If client is None and IP whitelist is active, deny
+        if request.client is None and not _skip_ip_check:
+            raise HTTPException(403, "Cannot determine client IP")
+
         # IP whitelist
-        client_ip = request.client.host if request.client else None
+        client_ip = _resolve_client_ip(request)
         if not _skip_ip_check and client_ip:
             try:
                 addr = ipaddress.ip_address(client_ip)
@@ -148,6 +167,22 @@ def build_debug_router(
             raise HTTPException(400, "Session has no controller")
 
         data = await request.json()
+
+        # Restrict allowed message types if configured
+        if allowed_message_types is not None:
+            msg_type = data.get("type", "")
+            if msg_type not in allowed_message_types:
+                raise HTTPException(
+                    400, f"Message type '{msg_type}' not allowed"
+                )
+
+        # Audit log for ws_send
+        logger.info(
+            "[DEBUG] ws_send session=%s type=%s",
+            session_id[:8],
+            data.get("type", "<none>"),
+        )
+
         await entry.controller.handle_message(data)
         return {"ok": True, "forwarded": data.get("type", "")}
 

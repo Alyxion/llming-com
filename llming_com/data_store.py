@@ -18,6 +18,10 @@ class SessionDataStore:
 
     All methods are class-level (shared across the process). Use namespaces
     to scope data to sessions or features.
+
+    Security note: Namespaces should be constructed server-side (e.g.
+    ``f"session:{session_id}:uploads"``) and never derived from user input
+    to prevent namespace traversal attacks.
     """
 
     _lock = threading.Lock()
