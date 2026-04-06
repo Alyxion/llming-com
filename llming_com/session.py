@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # Cleanup defaults
 DEFAULT_CLEANUP_INTERVAL = 60  # seconds
 DEFAULT_SESSION_TTL = 300  # seconds
+DEFAULT_HEARTBEAT_TTL = 120  # seconds — reap "connected" sessions with no heartbeat
 
 E = TypeVar("E", bound="BaseSessionEntry")
 
@@ -40,6 +41,7 @@ class BaseSessionEntry:
     controller: Optional[Any] = None
     created_at: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
+    last_heartbeat: float = field(default_factory=time.monotonic)
     _cleanup_done: bool = field(default=False, repr=False)
 
 
@@ -107,24 +109,61 @@ class BaseSessionRegistry(Generic[E]):
         """Number of active sessions."""
         return len(self._sessions)
 
-    def cleanup_expired(self, ttl: float = DEFAULT_SESSION_TTL) -> int:
+    def cleanup_expired(
+        self,
+        ttl: float = DEFAULT_SESSION_TTL,
+        heartbeat_ttl: float = DEFAULT_HEARTBEAT_TTL,
+    ) -> int:
         """Remove sessions idle for more than *ttl* seconds.
 
-        Sessions with an active WebSocket connection are never expired.
+        Also reaps zombie sessions — sessions with a WebSocket reference
+        but no heartbeat for more than *heartbeat_ttl* seconds.  These
+        occur when a proxy silently drops the TCP connection and the
+        server never receives a disconnect event.
+
         Override ``on_session_expired`` for cleanup hooks.
         """
         now = time.monotonic()
-        expired = [
-            sid
-            for sid, entry in self._sessions.items()
-            if now - entry.last_activity > ttl and entry.websocket is None
-        ]
+        expired = []
+        for sid, entry in self._sessions.items():
+            if entry.websocket is None and now - entry.last_activity > ttl:
+                # Disconnected and idle — normal expiry
+                expired.append(sid)
+            elif entry.websocket is not None and now - entry.last_heartbeat > heartbeat_ttl:
+                # Zombie — websocket ref exists but no heartbeat
+                logger.warning(
+                    "[SESSION] Reaping zombie session %s (no heartbeat for %ds)",
+                    sid[:8],
+                    int(now - entry.last_heartbeat),
+                )
+                try:
+                    import asyncio
+                    asyncio.get_running_loop().create_task(self._close_zombie(entry))
+                except RuntimeError:
+                    pass
+                entry.websocket = None
+                expired.append(sid)
+
         for sid in expired:
             entry = self._sessions.pop(sid)
             self.on_session_expired(sid, entry)
         if expired:
             logger.info("[SESSION] Cleaned up %d expired sessions", len(expired))
         return len(expired)
+
+    @staticmethod
+    async def _close_zombie(entry: E) -> None:
+        """Try to close a zombie WebSocket and run controller cleanup."""
+        if entry.websocket:
+            try:
+                await entry.websocket.close(code=4004, reason="Heartbeat timeout")
+            except Exception:
+                pass
+        if entry.controller:
+            try:
+                await entry.controller.cleanup()
+            except Exception:
+                pass
 
     def on_session_expired(self, session_id: str, entry: E) -> None:
         """Hook called when a session expires. Override for cleanup."""

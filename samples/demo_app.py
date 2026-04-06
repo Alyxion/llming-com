@@ -27,6 +27,7 @@ from llming_com import (
     CommandScope,
     get_auth,
     get_default_command_registry,
+    mount_client_static,
     run_websocket_session,
     AUTH_COOKIE_NAME,
     SESSION_COOKIE_NAME,
@@ -172,6 +173,7 @@ async def on_disconnect(session_id: str, entry: DemoSessionEntry):
 
 app = FastAPI(title="llming-com demo")
 auth = get_auth()
+mount_client_static(app)
 
 # Debug router
 import os
@@ -263,6 +265,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </div>
 <div id="log"></div>
 
+<script src="/llming-com/llming-ws.js"></script>
 <script>
 const SID = "__SESSION_ID__";
 let ws = null;
@@ -271,37 +274,52 @@ const cmdBtns = ['b1','b2','b3','b4','b5','b6'];
 
 function log(dir, data) {
   const t = new Date().toLocaleTimeString();
-  const pre = dir === 'in' ? '<span class="dir-in">&larr; recv</span>' : '<span class="dir-out">&rarr; send</span>';
-  const line = `<span class="ts">${t}</span> ${pre}  ${typeof data === 'string' ? data : JSON.stringify(data, null, 2)}`;
+  const cls = dir === 'in' ? 'dir-in' : 'dir-out';
+  const arrow = dir === 'in' ? '&larr; recv' : '&rarr; send';
+  const pre = `<span class="${cls}">${arrow}</span>`;
+  const body = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
   const d = el('log');
-  d.innerHTML += line + '\\n';
+  d.innerHTML += `<span class="ts">${t}</span> ${pre}  ${body}\\n`;
   d.scrollTop = d.scrollHeight;
 }
 
+function setConnected(on) {
+  el('btnConn').textContent = on ? 'Disconnect' : 'Connect WebSocket';
+  el('btnConn').classList.toggle('on', on);
+  cmdBtns.forEach(b => el(b).disabled = !on);
+}
+
 function toggleWs() {
-  if (ws && ws.readyState <= 1) { ws.close(); return; }
+  if (ws && ws.connected) { ws.close(); ws = null; return; }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws/${SID}`);
-  ws.onopen = () => {
-    log('sys', '-- connected --');
-    el('btnConn').textContent = 'Disconnect';
-    el('btnConn').classList.add('on');
-    cmdBtns.forEach(b => el(b).disabled = false);
-  };
-  ws.onmessage = e => { try { log('in', JSON.parse(e.data)); } catch { log('in', e.data); } };
-  ws.onclose = () => {
-    log('sys', '-- disconnected --');
-    el('btnConn').textContent = 'Connect WebSocket';
-    el('btnConn').classList.remove('on');
-    cmdBtns.forEach(b => el(b).disabled = true);
-    ws = null;
-  };
+  ws = new LlmingWebSocket(`${proto}://${location.host}/ws/${SID}`, {
+    onMessage(msg) { log('in', msg); },
+    onOpen() {
+      log('sys', '-- connected --');
+      setConnected(true);
+    },
+    onClose() {
+      log('sys', '-- disconnected --');
+      setConnected(false);
+    },
+    onReconnecting(info) {
+      log('sys', `-- reconnecting (${info.attempt}/${info.maxAttempts}) --`);
+    },
+    onReconnected() {
+      log('sys', '-- reconnected --');
+    },
+    onSessionLost(info) {
+      log('sys', `-- session lost: ${info.reason} --`);
+      ws = null;
+    },
+  });
+  ws.connect();
 }
 
 function sendCmd(name, args) {
-  if (!ws || ws.readyState !== 1) return;
+  if (!ws || !ws.connected) return;
   const msg = { type: 'command', name, args: args || {} };
-  ws.send(JSON.stringify(msg));
+  ws.send(msg);
   log('out', msg);
 }
 </script>

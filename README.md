@@ -25,6 +25,7 @@ LLMing-Com connects JavaScript frontends to Python backends over WebSockets with
 - HMAC-SHA256 cookie authentication (session + identity tokens with expiry)
 - Generic session registry with singleton pattern and TTL cleanup
 - WebSocket transport with connection superseding and rate limiting
+- **JavaScript client** with auto-reconnect, heartbeat, and session-loss detection (framework-agnostic)
 - Declarative `@command` framework with auto-generated REST + MCP endpoints
 - Debug API with IP whitelisting, audit logging, and trusted proxy support
 - Thread-safe in-memory data store with namespace isolation
@@ -71,6 +72,35 @@ app.include_router(build_debug_router(registry, api_key_env="DEBUG_KEY"))
 # POST /debug/sessions/{id}/ws_send
 ```
 
+### JavaScript Client (auto-reconnect)
+
+```html
+<script src="/llming-com/llming-ws.js"></script>
+<script>
+const ws = new LlmingWebSocket('ws://localhost:8001/ws/my-session', {
+  onMessage(msg)       { console.log('Got:', msg); },
+  onReconnecting(info) { console.log(`Reconnecting ${info.attempt}/${info.maxAttempts}`); },
+  onSessionLost(info)  { location.href = '/login'; },
+});
+ws.connect();
+ws.send({ type: 'command', name: 'ping' });
+</script>
+```
+
+Mount the static files from Python:
+
+```python
+from llming_com import mount_client_static
+mount_client_static(app)  # serves /llming-com/llming-ws.js
+```
+
+Works with any JS framework (vanilla, Vue, React, Svelte, etc.). Features:
+- Exponential-backoff reconnect (configurable max attempts and backoff)
+- Heartbeat keepalive (15s default) with ack timeout — shows warning banner if server stops responding
+- Handles llming-com close codes (4004 not-found, 4001 superseded)
+- Optional built-in reconnect/warning banner (`showBanner: false` to disable)
+- Zero dependencies, no DOM required (works in Web Workers too)
+
 ### Cookie Auth
 
 ```python
@@ -89,8 +119,9 @@ if auth.verify_auth_cookie(request):
 
 ```
 llming_com/           Core library (auth, session, transport, commands, debug, data store)
+llming_com/static/    JavaScript client (LlmingWebSocket)
 tests/                Pytest suite
-samples/              Example applications
+samples/              Example applications (run with: LLMING_AUTH_SECRET=demo python samples/demo_app.py)
 docs/                 Documentation and assets
 ```
 

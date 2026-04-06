@@ -78,6 +78,7 @@ async def run_websocket_session(
 
     await websocket.accept()
     entry.websocket = websocket
+    entry.last_heartbeat = time.monotonic()
     logger.info("[%s] Connected: %s...", log_prefix, sid_short)
 
     # Transport-level rate limiting state
@@ -112,6 +113,8 @@ async def run_websocket_session(
                 msg = json.loads(raw)
                 if not isinstance(msg, dict):
                     continue
+                if msg.get("type") == "heartbeat":
+                    entry.last_heartbeat = time.monotonic()
                 await on_message(entry, msg)
             except json.JSONDecodeError:
                 logger.warning("[%s] Invalid JSON from %s...", log_prefix, sid_short)

@@ -32,6 +32,7 @@ from llming_com.data_store import SessionDataStore
 from llming_com.debug import build_debug_router
 from llming_com.session import BaseSessionEntry, BaseSessionRegistry
 from llming_com.session_manager import ConnectionType, SessionContext, SessionManager
+from llming_com.client_static import mount_client_static
 from llming_com.transport import run_websocket_session
 
 __all__ = [
@@ -64,4 +65,6 @@ __all__ = [
     "ConnectionType",
     # DataStore
     "SessionDataStore",
+    # Client static
+    "mount_client_static",
 ]

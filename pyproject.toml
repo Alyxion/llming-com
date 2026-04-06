@@ -16,6 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 packages = [{include = "llming_com"}]
+include = [{path = "llming_com/static", format = ["sdist", "wheel"]}]
 
 [tool.poetry.urls]
 "Author" = "https://github.com/Alyxion"
