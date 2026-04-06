@@ -74,13 +74,15 @@ app.include_router(build_debug_router(registry, api_key_env="DEBUG_KEY"))
 ### Cookie Auth
 
 ```python
-from llming_com import sign_auth_token, verify_auth_cookie
+from llming_com import get_auth
 
-token = sign_auth_token("session-abc")
-response.set_cookie("llming_auth", token, httponly=True, samesite="lax")
+auth = get_auth()
+token = auth.sign_auth_token("session-abc")
+response.set_cookie("llming_auth", token, httponly=True, secure=True, samesite="lax")
 
-if verify_auth_cookie(request):
-    print("Authenticated!")
+if auth.verify_auth_cookie(request):
+    session_id = auth.get_auth_session_id(request)
+    print(f"Authenticated: {session_id}")
 ```
 
 ## Project Structure

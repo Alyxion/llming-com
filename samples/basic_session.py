@@ -6,7 +6,7 @@ and look them up by ID.
 
 from dataclasses import dataclass
 
-from llming_com import BaseSessionEntry, BaseSessionRegistry, make_auth_cookie_value
+from llming_com import BaseSessionEntry, BaseSessionRegistry, get_auth
 
 
 @dataclass
@@ -27,8 +27,9 @@ def main():
     registry = ChatRegistry.get()
 
     # Create two sessions
-    sid1, token1 = make_auth_cookie_value()
-    sid2, token2 = make_auth_cookie_value()
+    auth = get_auth()
+    sid1, token1 = auth.make_auth_cookie_value()
+    sid2, token2 = auth.make_auth_cookie_value()
 
     registry.register(sid1, ChatSession(user_id="alice", model="claude-sonnet", language="de"))
     registry.register(sid2, ChatSession(user_id="bob", model="gpt-4o", language="en"))
