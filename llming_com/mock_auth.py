@@ -102,15 +102,16 @@ def build_mock_login_router() -> APIRouter:
         await graph.cache_profile_to_redis_async()
 
         # ── Set cookies + redirect ───────────────────────────
-        from llming_com.auth import sign_auth_token, sign_identity_token
+        from llming_com.auth import get_auth as _auth
 
+        auth = _auth()
         response = RedirectResponse(url="/chat", status_code=302)
-        identity_token = sign_identity_token(session_id)
+        identity_token = auth.sign_identity_token(session_id)
         response.set_cookie(
             "llming_identity", identity_token,
             httponly=True, samesite="lax", secure=True, max_age=7 * 24 * 3600,
         )
-        auth_token = sign_auth_token(session_id)
+        auth_token = auth.sign_auth_token(session_id)
         response.set_cookie(
             "llming_auth", auth_token,
             httponly=True, samesite="lax", secure=True, max_age=7 * 24 * 3600,

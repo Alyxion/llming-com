@@ -19,7 +19,7 @@ from typing import Any, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from llming_com.auth import get_auth_session_id
+from llming_com.auth import get_auth as _auth
 from llming_com.command import (
     CommandDef,
     CommandError,
@@ -117,7 +117,7 @@ def _mount_command(
                 # Resolve "current" to the most recently active session
                 # scoped to the authenticated user
                 if session_id == "current":
-                    auth_sid = get_auth_session_id(request)
+                    auth_sid = _auth().get_auth_session_id(request)
                     sessions = session_registry.list_sessions()
                     if not sessions:
                         raise HTTPException(404, "No active sessions")

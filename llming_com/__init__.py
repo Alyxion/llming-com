@@ -15,12 +15,8 @@ from llming_com.auth import (
     AUTH_COOKIE_NAME,
     IDENTITY_COOKIE_NAME,
     SESSION_COOKIE_NAME,
-    get_auth_session_id,
-    make_auth_cookie_value,
-    sign_auth_token,
-    sign_identity_token,
-    verify_auth_cookie,
-    verify_identity_cookie,
+    AuthManager,
+    get_auth,
 )
 from llming_com.command import (
     command,
@@ -39,15 +35,11 @@ from llming_com.transport import run_websocket_session
 
 __all__ = [
     # Auth
+    "AuthManager",
+    "get_auth",
     "AUTH_COOKIE_NAME",
     "SESSION_COOKIE_NAME",
     "IDENTITY_COOKIE_NAME",
-    "sign_auth_token",
-    "verify_auth_cookie",
-    "get_auth_session_id",
-    "sign_identity_token",
-    "verify_identity_cookie",
-    "make_auth_cookie_value",
     # Session
     "BaseSessionEntry",
     "BaseSessionRegistry",

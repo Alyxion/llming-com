@@ -15,7 +15,7 @@ def _reset_auth_secret():
     This ensures that each test starts with a clean secret state,
     picking up whatever LLMING_AUTH_SECRET is set in the environment.
     """
-    from llming_com.auth import _reset_secret
-    _reset_secret()
+    from llming_com.auth import _reset_default
+    _reset_default()
     yield
-    _reset_secret()
+    _reset_default()
