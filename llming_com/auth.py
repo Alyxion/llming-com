@@ -25,7 +25,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Cookie names
+# Default cookie names (used when no app_name is specified)
 AUTH_COOKIE_NAME = "llming_auth"
 SESSION_COOKIE_NAME = "llming_session"
 IDENTITY_COOKIE_NAME = "llming_identity"
@@ -34,18 +34,32 @@ IDENTITY_COOKIE_NAME = "llming_identity"
 class AuthManager:
     """HMAC-based cookie auth manager.
 
-    Encapsulates the auth secret and all signing/verification logic.
-    Use the module-level ``default()`` function to get the shared instance.
+    Each app should use its own ``app_name`` to avoid cookie collisions
+    when multiple llming-com apps run on the same domain::
+
+        auth = AuthManager(app_name="openhort")
+        # cookies: openhort_auth, openhort_session, openhort_identity
+
+        auth = AuthManager(app_name="llming-chat")
+        # cookies: llming-chat_auth, llming-chat_session, llming-chat_identity
+
+        auth = AuthManager()  # default: llming_auth, llming_session, llming_identity
     """
 
-    def __init__(self, secret: str | None = None):
+    def __init__(self, secret: str | None = None, *, app_name: str = ""):
         """Create an AuthManager.
 
         Args:
             secret: HMAC secret. If ``None``, reads ``LLMING_AUTH_SECRET``
                 from the environment (lazy, on first use).
+            app_name: App-specific prefix for cookie names. If empty,
+                uses the default ``llming_*`` names.
         """
         self._secret: str | None = secret
+        prefix = app_name.replace("-", "_") if app_name else "llming"
+        self.auth_cookie_name = f"{prefix}_auth"
+        self.session_cookie_name = f"{prefix}_session"
+        self.identity_cookie_name = f"{prefix}_identity"
 
     @property
     def secret(self) -> str:
@@ -85,7 +99,7 @@ class AuthManager:
 
         Returns True if the cookie is present and the HMAC signature is valid.
         """
-        token = request.cookies.get(AUTH_COOKIE_NAME)
+        token = request.cookies.get(self.auth_cookie_name)
         if not token or "." not in token:
             return False
 
@@ -124,7 +138,7 @@ class AuthManager:
 
         Returns None if the cookie is missing or invalid.
         """
-        token = request.cookies.get(AUTH_COOKIE_NAME)
+        token = request.cookies.get(self.auth_cookie_name)
         if not token or "." not in token:
             return None
 
@@ -181,7 +195,7 @@ class AuthManager:
 
         Returns the identity_id if valid and not expired, None otherwise.
         """
-        token = request.cookies.get(IDENTITY_COOKIE_NAME)
+        token = request.cookies.get(self.identity_cookie_name)
         if not token or "." not in token:
             return None
 

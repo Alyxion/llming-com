@@ -28,6 +28,7 @@ from llming_com.command import (
 )
 from llming_com.command_router import build_command_router
 from llming_com.controller import BaseController
+from llming_com.ws_router import WSRouter
 from llming_com.data_store import SessionDataStore
 from llming_com.debug import build_debug_router
 from llming_com.session import BaseSessionEntry, BaseSessionRegistry
@@ -49,6 +50,7 @@ __all__ = [
     "run_websocket_session",
     # Controller
     "BaseController",
+    "WSRouter",
     # Debug
     "build_debug_router",
     # Commands

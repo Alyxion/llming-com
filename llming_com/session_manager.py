@@ -182,7 +182,7 @@ class SessionManager(Generic[E]):
                 candidate_id = parts[0]
                 # Verify by reconstructing — reuse cookie verification logic
                 if self._auth.verify_auth_cookie(
-                    _FakeRequest({"llming_auth": token})
+                    _FakeRequest({self._auth.auth_cookie_name: token})
                 ):
                     entry = self._registry.get_session(candidate_id)
                     if entry:
@@ -192,7 +192,7 @@ class SessionManager(Generic[E]):
         params = getattr(request, "query_params", {})
         token = params.get("session_id", "") or params.get("sid", "")
         if token and "." in token:
-            if self._auth.verify_auth_cookie(_FakeRequest({"llming_auth": token})):
+            if self._auth.verify_auth_cookie(_FakeRequest({self._auth.auth_cookie_name: token})):
                 candidate_id = token.split(".")[0]
                 entry = self._registry.get_session(candidate_id)
                 if entry:
