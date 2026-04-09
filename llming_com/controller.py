@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 class BaseController:
     """Minimal WebSocket controller with send, heartbeat, and rate limiting.
 
-    Subclass to add domain-specific message handling.
+    Subclass to add domain-specific message handling. Supports automatic
+    dispatch via ``WSRouter`` for namespaced commands (e.g. "llmings.list").
 
     Args:
         session_id: The session this controller manages.
@@ -39,6 +40,7 @@ class BaseController:
         self._rate_limit_window = rate_limit_window
         self._rate_limit_max = rate_limit_max
         self._request_timestamps: list[float] = []
+        self._ws_dispatch_table: Optional[dict] = None  # cached from WSRouter
 
     def set_websocket(self, ws: Optional[Any]) -> None:
         """Set or clear the active WebSocket connection."""
@@ -74,15 +76,61 @@ class BaseController:
         self._request_timestamps.append(now)
         return True
 
+    def mount_router(self, router: Any) -> None:
+        """Mount a ``WSRouter`` for automatic message dispatch.
+
+        Call once during setup. Messages matching router routes are
+        handled automatically in ``handle_message`` before falling
+        through to subclass overrides.
+        """
+        from llming_com.ws_router import WSRouter
+        if isinstance(router, WSRouter):
+            self._ws_dispatch_table = router.build_dispatch_table()
+
     async def handle_message(self, msg: dict) -> None:
         """Handle an incoming WebSocket message.
 
-        Override in subclasses. The base implementation handles heartbeat.
+        Dispatch order:
+        1. Heartbeat (built-in)
+        2. WSRouter dispatch table (namespaced commands like "llmings.list")
+        3. Subclass override (for legacy message types)
         """
         msg_type = msg.get("type", "")
         if msg_type == "heartbeat":
             await self.send({"type": "heartbeat_ack"})
             return
+
+        # Try WSRouter dispatch
+        if self._ws_dispatch_table:
+            from llming_com.ws_router import WSRouter
+            route = self._ws_dispatch_table.get(msg_type)
+            if route:
+                import inspect as _inspect
+                kwargs: dict[str, Any] = {}
+                sig = _inspect.signature(route.handler)
+                for pname in sig.parameters:
+                    if pname == "controller":
+                        kwargs["controller"] = self
+                    elif pname == "send":
+                        kwargs["send"] = self.send
+                    elif pname in msg:
+                        kwargs[pname] = msg[pname]
+                try:
+                    result = await route.handler(**kwargs)
+                    if result is not None:
+                        resp = {"type": msg_type, **result}
+                        # Preserve _req_id for request/response matching
+                        if "_req_id" in msg:
+                            resp["_req_id"] = msg["_req_id"]
+                        await self.send(resp)
+                except Exception as exc:
+                    logger.error("WSRouter handler %s failed: %s", msg_type, exc)
+                    resp = {"type": msg_type, "error": str(exc)}
+                    if "_req_id" in msg:
+                        resp["_req_id"] = msg["_req_id"]
+                    await self.send(resp)
+                return
+
         logger.debug("[CONTROLLER] Unhandled message type: %s", msg_type)
 
     async def cleanup(self) -> None:
