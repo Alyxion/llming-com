@@ -147,6 +147,9 @@ class WSRouter:
 
         # Auto-send response if handler returns a value
         if result is not None:
-            await controller.send({"type": msg_type, **result})
+            response = {"type": msg_type, **result}
+            if "_req_id" in msg:
+                response["_req_id"] = msg["_req_id"]
+            await controller.send(response)
 
         return True

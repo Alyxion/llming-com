@@ -22,7 +22,7 @@ include = [{path = "llming_com/static", format = ["sdist", "wheel"]}]
 "Author" = "https://github.com/Alyxion"
 
 [tool.poetry.dependencies]
-python = ">=3.14,<4"
+python = ">=3.12,<4"
 starlette = ">=0.27"
 fastapi = ">=0.100"
 

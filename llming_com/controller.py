@@ -4,10 +4,13 @@ Provides ``BaseController`` with:
 - Safe JSON send over WebSocket
 - Rate limiting
 - Heartbeat handling
+- UI action dispatch (run_js, get_console, etc.)
+- Pending response futures for request/response patterns
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -41,6 +44,7 @@ class BaseController:
         self._rate_limit_max = rate_limit_max
         self._request_timestamps: list[float] = []
         self._ws_dispatch_table: Optional[dict] = None  # cached from WSRouter
+        self._pending_responses: dict[str, asyncio.Future] = {}  # action → Future
 
     def set_websocket(self, ws: Optional[Any]) -> None:
         """Set or clear the active WebSocket connection."""
@@ -100,6 +104,11 @@ class BaseController:
             await self.send({"type": "heartbeat_ack"})
             return
 
+        # Resolve pending ui_action responses from the browser
+        if msg_type == "ui_action_response":
+            self.resolve_ui_response(msg)
+            return
+
         # Try WSRouter dispatch
         if self._ws_dispatch_table:
             from llming_com.ws_router import WSRouter
@@ -133,9 +142,62 @@ class BaseController:
 
         logger.debug("[CONTROLLER] Unhandled message type: %s", msg_type)
 
+    # ── UI Action framework ────────────────────────────────
+
+    async def send_ui_action(self, action: str, **kwargs: Any) -> bool:
+        """Send a ui_action message to the browser.
+
+        The browser's ``handleControlMessage`` dispatches these to
+        a ``ui_action`` handler.
+        """
+        return await self.send({"type": "ui_action", "action": action, **kwargs})
+
+    async def request_ui_action(self, action: str, timeout: float = 5.0, **kwargs: Any) -> dict[str, Any]:
+        """Send a ui_action and wait for the browser's response.
+
+        The browser sends back ``{type: "ui_action_response", action: "...", ...}``.
+        Returns the response dict, or ``{"error": "timeout"}`` on timeout.
+        """
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+        self._pending_responses[action] = future
+        await self.send({"type": "ui_action", "action": action, **kwargs})
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"error": "timeout", "action": action}
+        finally:
+            self._pending_responses.pop(action, None)
+
+    def resolve_ui_response(self, msg: dict[str, Any]) -> bool:
+        """Resolve a pending ui_action_response future. Returns True if matched."""
+        action = msg.get("action", "")
+        future = self._pending_responses.get(action)
+        if future and not future.done():
+            future.set_result(msg)
+            return True
+        return False
+
+    async def run_js(self, code: str) -> bool:
+        """Execute JavaScript in the connected browser."""
+        return await self.send_ui_action("run_js", code=code)
+
+    async def get_console_logs(self, level: str = "", pattern: str = "", since: int = 0) -> dict[str, Any]:
+        """Read browser console logs. Requires client-side console capture."""
+        return await self.request_ui_action(
+            "get_console_logs", level=level, pattern=pattern, since=since,
+        )
+
+    async def eval_js(self, code: str, timeout: float = 5.0) -> dict[str, Any]:
+        """Execute JS in browser and return the result."""
+        return await self.request_ui_action("eval_js", code=code, timeout=timeout)
+
     async def cleanup(self) -> None:
         """Clean up resources when the session disconnects.
 
         Override in subclasses to cancel tasks, close connections, etc.
         """
-        pass
+        # Cancel any pending UI action futures
+        for future in self._pending_responses.values():
+            if not future.done():
+                future.cancel()
+        self._pending_responses.clear()
