@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = Path(__file__).parent.parent / "static"
 
 
 def mount_client_static(app, path: str = "/llming-com") -> str:

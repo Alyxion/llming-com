@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from llming_com.client_static import STATIC_DIR, mount_client_static
+from llming_com.server import STATIC_DIR, mount_client_static
 
 
 class TestClientStatic:
