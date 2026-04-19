@@ -34,14 +34,14 @@ IDENTITY_COOKIE_NAME = "llming_identity"
 class AuthManager:
     """HMAC-based cookie auth manager.
 
+    Encapsulates the auth secret and all signing/verification logic.
+    Use the module-level ``default()`` function to get the shared instance.
+
     Each app should use its own ``app_name`` to avoid cookie collisions
     when multiple llming-com apps run on the same domain::
 
         auth = AuthManager(app_name="openhort")
         # cookies: openhort_auth, openhort_session, openhort_identity
-
-        auth = AuthManager(app_name="llming-chat")
-        # cookies: llming-chat_auth, llming-chat_session, llming-chat_identity
 
         auth = AuthManager()  # default: llming_auth, llming_session, llming_identity
     """
@@ -190,7 +190,7 @@ class AuthManager:
         ).hexdigest()
         return f"{identity_id}.{ts}.{sig}"
 
-    def verify_identity_cookie(self, request, max_age: int = 604800) -> Optional[str]:
+    def verify_identity_cookie(self, request, max_age: int = 2592000) -> Optional[str]:
         """Extract and verify the ``llming_identity`` cookie.
 
         Returns the identity_id if valid and not expired, None otherwise.

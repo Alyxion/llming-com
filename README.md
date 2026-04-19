@@ -15,18 +15,31 @@ LLMing-Com connects JavaScript frontends to Python backends over WebSockets with
 
 ## Why?
 
-- **AI controls the frontend** -- One `@command` decorator exposes a function as a REST endpoint *and* an MCP tool. An AI agent can list sessions, send messages, and trigger actions without custom glue code.
-- **AI debugs your app** -- The debug API lets agents inspect sessions, view state, and forward WebSocket messages in real time.
-- **One decorator = one command** -- Define a command once; get HTTP routing, parameter validation, JSON Schema, and MCP tooling for free.
+- **WS-first UI traffic** -- `WSRouter` gives you FastAPI-style namespaced dispatch for WebSocket JSON messages. One socket carries every UI command and query.
+- **AI controls and debugs your app** -- The debug API and `@command` decorator expose a parallel HTTP/MCP surface for AI agents and tooling, separate from the UI socket.
+- **One decorator, one debug command** -- Define a debug/admin command once with `@command`; get an HTTP endpoint, JSON schema, and MCP tool for free.
 - **Sessions just work** -- Type-safe registry with TTL cleanup, WebSocket lifecycle management, and connection superseding built in.
+
+## Transport Policy
+
+Two surfaces, two router types -- pick by audience, not by preference:
+
+| Audience | Transport | Router | Used for |
+|---|---|---|---|
+| UI / app frontend | WebSocket | `WSRouter` | All command and query traffic between the live frontend and backend |
+| AI agents, MCP clients, ops tools | HTTP | `build_command_router` / `build_debug_router` | Debug/admin surface: session inspection, ws_send forwarding, `@command`-decorated debug actions |
+| Anyone | HTTP | (your own FastAPI routes) | Large or static content only -- file uploads, blob downloads, asset serving |
+
+Do not add HTTP routes for UI commands -- those belong on `WSRouter`. Do not push large blobs through the WS message pipe -- those belong on plain HTTP endpoints. The `@command` framework is for the debug/admin surface; it is not a UI command system.
 
 ## Features
 
 - HMAC-SHA256 cookie authentication (session + identity tokens with expiry)
 - Generic session registry with singleton pattern and TTL cleanup
 - WebSocket transport with connection superseding and rate limiting
+- **`WSRouter`** -- FastAPI-style namespaced dispatch for WS messages, nestable via `include()`, auto-replies with `_req_id` matching
 - **JavaScript client** with auto-reconnect, heartbeat, and session-loss detection (framework-agnostic)
-- Declarative `@command` framework with auto-generated REST + MCP endpoints
+- Declarative `@command` framework for the debug/admin surface, with auto-generated REST + MCP endpoints
 - Debug API with IP whitelisting, audit logging, and trusted proxy support
 - Thread-safe in-memory data store with namespace isolation
 - Mock auth system for headless and E2E testing
@@ -34,7 +47,38 @@ LLMing-Com connects JavaScript frontends to Python backends over WebSockets with
 
 ## Quick Start
 
-### Commands
+### UI commands (`WSRouter`)
+
+Namespaced dispatch for WS JSON messages. Each module owns a `WSRouter(prefix=...)`; assemble them into a root router and dispatch from your controller. Handlers may return a dict -- the router auto-replies on the same socket and forwards `_req_id` for request/response matching.
+
+```python
+# windows.py
+from llming_com import WSRouter
+
+router = WSRouter(prefix="windows")
+
+@router.handler("list")
+async def list_windows(controller):
+    return {"windows": [...]}
+
+@router.handler("focus")
+async def focus(controller, window_id: str):
+    await controller.focus(window_id)
+    return {"ok": True}
+
+# app.py -- assemble and dispatch
+from llming_com import WSRouter
+root = WSRouter()
+root.include(router)            # → windows.list, windows.focus
+table = root.build_dispatch_table()
+
+async def on_message(entry, msg):
+    await root.dispatch(msg["type"], msg, entry.controller, _table=table)
+```
+
+### Debug commands (`@command`)
+
+For the AI/MCP/debug surface only. Generates an HTTP REST endpoint *and* an MCP tool from a single declaration.
 
 ```python
 from llming_com import command, CommandScope
