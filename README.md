@@ -143,6 +143,7 @@ Works with any JS framework (vanilla, Vue, React, Svelte, etc.). Features:
 - Heartbeat keepalive (15s default) with ack timeout — shows warning banner if server stops responding
 - Handles llming-com close codes (4004 not-found, 4001 superseded)
 - Optional built-in reconnect/warning banner (`showBanner: false` to disable)
+- Offline mode: `new LlmingWebSocket(url, { offline: true })` makes `connect()` and `send()` no-ops; useful for self-contained demo bundles where every message is served by an in-page mock. Auto-detected when `window.__LLMING_OFFLINE__` is `true`.
 - Zero dependencies, no DOM required (works in Web Workers too)
 
 ### Cookie Auth
@@ -152,12 +153,40 @@ from llming_com import get_auth
 
 auth = get_auth()
 token = auth.sign_auth_token("session-abc")
-response.set_cookie("llming_auth", token, httponly=True, secure=True, samesite="lax")
+response.set_cookie(auth.auth_cookie_name, token, httponly=True, secure=True, samesite="lax")
 
 if auth.verify_auth_cookie(request):
     session_id = auth.get_auth_session_id(request)
     print(f"Authenticated: {session_id}")
 ```
+
+**Always read cookie names from the `AuthManager` instance** (`auth.auth_cookie_name`, `auth.session_cookie_name`, `auth.identity_cookie_name`). Don't import the module-level `AUTH_COOKIE_NAME` etc. — those only resolve to the default-prefix names and defeat per-app isolation.
+
+#### Unified auth across pages
+
+`get_auth()` returns a process-wide **singleton**. Every page in an app — hub, chat, admin, anything else the host mounts — that calls `get_auth()` receives the same `AuthManager`, with the same HMAC secret and the same cookie names. Cookies set on `path="/"` during OAuth callback are readable by every subsequent request, so a user who authenticates on the hub page can navigate to the chat page without re-login, and vice versa. Identity tokens have a 30-day TTL by default; session tokens default to 24 hours.
+
+The flow in a typical multi-page app (e.g. a landing hub + a chat page):
+
+1. User visits `/` (hub). Host's `session_setup` callback calls `get_auth().verify_identity_cookie(request)`.
+2. No valid identity → host returns `None`, hub calls `oauth_start_handler` → OAuth provider redirect.
+3. Provider redirects back with `?code=…`. Host's `oauth_callback_handler` exchanges the code, calls `auth.sign_identity_token(sid)`, sets the identity + auth cookies.
+4. User navigates to `/chat`. Chat's session factory calls the **same** `get_auth().verify_identity_cookie(request)`, gets a valid session, builds the chat session without a second OAuth round-trip.
+
+The host chooses cookie scope: keep `path="/"` so every page under the domain sees the cookies.
+
+#### Per-app isolation (`app_name`)
+
+When two different llming-com apps share a domain (e.g. `example.com/chat` and `example.com/admin`, deployed independently), cookie-name collisions cause cross-talk. Solve this at the top of the host by constructing the singleton with an explicit `app_name`:
+
+```python
+# In your app's startup module, BEFORE any get_auth() call:
+from llming_com.auth import AuthManager
+import llming_com.auth as _auth_mod
+_auth_mod._default_instance = AuthManager(app_name="myapp")
+```
+
+Once that's done, every subsequent `get_auth()` in any page returns the app-named manager. Cookies become `myapp_auth` / `myapp_session` / `myapp_identity`, cleanly separated from a sibling app using `otherapp_*`. Pages don't change — they already read names from the instance.
 
 ## Project Structure
 

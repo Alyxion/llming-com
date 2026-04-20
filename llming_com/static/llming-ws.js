@@ -59,6 +59,13 @@ class LlmingWebSocket {
     this._bannerText          = options.bannerText ?? 'Reconnecting\u2026';
     this._warningText         = options.warningText ?? 'Connection unstable\u2026';
 
+    // Offline mode: connect() and send() are no-ops, no socket is opened.
+    // Useful for self-contained demo bundles where every command/query
+    // is served by an in-page mock (the consumer routes those through
+    // their own dispatcher; this client just stays out of the way).
+    // Defaults to ``window.__LLMING_OFFLINE__`` if present.
+    this._offline = options.offline ?? (typeof window !== 'undefined' && !!window.__LLMING_OFFLINE__);
+
     this.ws = null;
     this._heartbeatTimer   = null;
     this._ackTimer         = null;
@@ -71,6 +78,10 @@ class LlmingWebSocket {
 
   /** Open the WebSocket connection.  Safe to call again after close(). */
   connect() {
+    if (this._offline) {
+      // No socket — consumer is responsible for serving everything in-page.
+      return;
+    }
     this._intentionalClose = false;
     this.ws = new WebSocket(this.url);
 

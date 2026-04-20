@@ -244,7 +244,9 @@ class TestIdentityToken:
         assert self.auth.verify_identity_cookie(req) is None
 
     def test_expired_token(self):
-        old_ts = int(time.time()) - 8 * 86400
+        # Default identity max_age is 30 days; use 31 to guarantee expiry
+        # without coupling the test to the exact TTL.
+        old_ts = int(time.time()) - 31 * 86400
         payload = f"id:oauth-exp:{old_ts}"
         sig = hmac.new(b"test-secret", payload.encode(), hashlib.sha256).hexdigest()
         expired_token = f"oauth-exp.{old_ts}.{sig}"

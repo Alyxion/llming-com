@@ -13,10 +13,10 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
 
 from llming_com import (
+    AuthManager,
     BaseSessionEntry,
     BaseSessionRegistry,
     build_debug_router,
-    make_auth_cookie_value,
     run_websocket_session,
 )
 
@@ -37,15 +37,22 @@ class EchoRegistry(BaseSessionRegistry["EchoEntry"]):
 
 app = FastAPI(title="LLMing-Com Echo Server")
 registry = EchoRegistry.get()
+# Per-app AuthManager so cookies don't collide with other llming-com apps
+# sharing the same domain.
+auth = AuthManager(app_name="echo")
 
 
 @app.post("/sessions")
 async def create_session(user_id: str = "anonymous"):
     """Create a new session and return the session ID."""
-    session_id, token = make_auth_cookie_value()
+    session_id, token = auth.make_auth_cookie_value()
     entry = EchoEntry(user_id=user_id)
     registry.register(session_id, entry)
-    return JSONResponse({"session_id": session_id, "token": token})
+    return JSONResponse({
+        "session_id": session_id,
+        "token": token,
+        "cookie_name": auth.auth_cookie_name,
+    })
 
 
 @app.websocket("/ws/{session_id}")
