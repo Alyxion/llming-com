@@ -29,6 +29,9 @@ from llming_com.session import BaseSessionRegistry
 logger = logging.getLogger(__name__)
 
 
+_LOCALHOST_ADDRS = {"127.0.0.1", "::1", "localhost"}
+
+
 def mount_mcp_server(
     app,
     session_registry: BaseSessionRegistry,
@@ -36,7 +39,8 @@ def mount_mcp_server(
     command_registry: Optional[CommandRegistry] = None,
     prefix: str = "/mcp",
     extras: Optional[dict] = None,
-    api_key: Optional[str] = None,
+    api_key: str,
+    localhost_only: bool = True,
 ) -> None:
     """Mount an MCP HTTP/SSE server on a FastAPI/Starlette app.
 
@@ -46,9 +50,13 @@ def mount_mcp_server(
         command_registry: Command registry (default: global).
         prefix: URL prefix for MCP endpoints.
         extras: Extra injectable values.
-        api_key: Optional API key. When set, requests must include an
-            ``x-mcp-key`` header with a matching value.
+        api_key: **Required.** Requests must include an ``x-mcp-key``
+            header with a matching value.
+        localhost_only: When True (default), reject requests from
+            non-loopback addresses.
     """
+    if not api_key:
+        raise ValueError("api_key is required — MCP must not be exposed without authentication")
     from mcp.server import Server
     from mcp.server.sse import SseServerTransport
     from mcp.types import TextContent, Tool
@@ -128,17 +136,34 @@ def mount_mcp_server(
     from starlette.responses import Response
     from starlette.routing import Mount, Route
 
+    def _check_access(request) -> Optional[Response]:
+        """Validate API key and localhost restriction. Returns an error Response or None."""
+        if localhost_only:
+            client = request.client
+            client_host = client.host if client else ""
+            if client_host not in _LOCALHOST_ADDRS:
+                logger.warning("[MCP] Rejected non-local request from %s", client_host)
+                return Response("Forbidden — MCP is localhost-only", status_code=403)
+        provided = request.headers.get("x-mcp-key", "")
+        if not hmac.compare_digest(provided, api_key):
+            return Response("Unauthorized", status_code=401)
+        return None
+
     async def handle_sse(request):
-        # API key check
-        if api_key:
-            provided = request.headers.get("x-mcp-key", "")
-            if not hmac.compare_digest(provided, api_key):
-                return Response("Unauthorized", status_code=401)
+        denied = _check_access(request)
+        if denied:
+            return denied
         async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
             await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
 
+    async def handle_post(request):
+        denied = _check_access(request)
+        if denied:
+            return denied
+        return await sse.handle_post_message(request.scope, request.receive, request._send)
+
     # Add routes to the app
     app.routes.insert(0, Route(f"{prefix}/sse", endpoint=handle_sse))
-    app.routes.insert(1, Mount(f"{prefix}/messages", app=sse.handle_post_message))
+    app.routes.insert(1, Route(f"{prefix}/messages/{{path:path}}", endpoint=handle_post, methods=["POST"]))
 
     logger.info("[MCP] HTTP/SSE server mounted at %s/sse", prefix)
