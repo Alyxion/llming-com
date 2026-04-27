@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generic, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Dict, Generic, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,66 @@ class BaseSessionEntry:
     last_activity: float = field(default_factory=time.monotonic)
     last_heartbeat: float = field(default_factory=time.monotonic)
     _cleanup_done: bool = field(default=False, repr=False)
+    _timers: dict[str, asyncio.Task] = field(default_factory=dict, init=False, repr=False)
+
+    async def send(self, msg: dict[str, Any]) -> bool:
+        """Send a reactive event over this session's active controller."""
+        if self.controller is None:
+            return False
+        return await self.controller.send(msg)
+
+    async def call(self, target: str, *args: Any, **kwargs: Any) -> bool:
+        """Call a named method on the connected browser session.
+
+        This mirrors client-side method calls used by UI frameworks: Python
+        names an addressed method such as ``"drawer.open"`` and passes
+        JSON-serializable arguments; the browser dispatcher looks up that
+        method on the mounted component and invokes it directly. No
+        JavaScript ``eval`` is involved.
+        """
+        if "." not in target:
+            raise ValueError("client call target must be '<component>.<method>'")
+        component, method = target.rsplit(".", 1)
+        return await self.send(
+            {
+                "type": "llming.call",
+                "target": component,
+                "method": method,
+                "args": list(args),
+                "kwargs": kwargs,
+            }
+        )
+
+    def start_timer(
+        self,
+        key: str,
+        interval: float,
+        callback: Callable[[], Awaitable[bool | None]],
+    ) -> asyncio.Task:
+        """Run *callback* every *interval* seconds until it returns ``False``.
+
+        The task is stored by ``key`` and an existing task with the same key
+        is cancelled first. This gives applications
+        per-session timers without hand-written sleep loops in handlers.
+        """
+        self.cancel_timer(key)
+
+        async def runner() -> None:
+            while True:
+                keep_going = await callback()
+                if keep_going is False:
+                    return
+                await asyncio.sleep(interval)
+
+        task = asyncio.create_task(runner())
+        self._timers[key] = task
+        return task
+
+    def cancel_timer(self, key: str) -> None:
+        """Cancel a task previously created with :meth:`start_timer`."""
+        task = self._timers.get(key)
+        if task and not task.done():
+            task.cancel()
 
 
 class BaseSessionRegistry(Generic[E]):

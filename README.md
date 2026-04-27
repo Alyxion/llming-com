@@ -15,7 +15,7 @@ LLMing-Com connects JavaScript frontends to Python backends over WebSockets with
 
 ## Why?
 
-- **WS-first UI traffic** -- `WSRouter` gives you FastAPI-style namespaced dispatch for WebSocket JSON messages. One socket carries every UI command and query.
+- **WS-first UI traffic** -- `SessionRouter` and `AppRouter` give you FastAPI-style namespaced dispatch for WebSocket JSON messages. One socket carries every UI command and query.
 - **AI controls and debugs your app** -- The debug API and `@command` decorator expose a parallel HTTP/MCP surface for AI agents and tooling, separate from the UI socket.
 - **One decorator, one debug command** -- Define a debug/admin command once with `@command`; get an HTTP endpoint, JSON schema, and MCP tool for free.
 - **Sessions just work** -- Type-safe registry with TTL cleanup, WebSocket lifecycle management, and connection superseding built in.
@@ -26,18 +26,19 @@ Two surfaces, two router types -- pick by audience, not by preference:
 
 | Audience | Transport | Router | Used for |
 |---|---|---|---|
-| UI / app frontend | WebSocket | `WSRouter` | All command and query traffic between the live frontend and backend |
+| UI / app frontend | WebSocket | `SessionRouter` | Per-user command and query traffic between the live frontend and backend |
+| UI / app frontend | WebSocket | `AppRouter` | App-wide commands with a typed app context |
 | AI agents, MCP clients, ops tools | HTTP | `build_command_router` / `build_debug_router` | Debug/admin surface: session inspection, ws_send forwarding, `@command`-decorated debug actions |
 | Anyone | HTTP | (your own FastAPI routes) | Large or static content only -- file uploads, blob downloads, asset serving |
 
-Do not add HTTP routes for UI commands -- those belong on `WSRouter`. Do not push large blobs through the WS message pipe -- those belong on plain HTTP endpoints. The `@command` framework is for the debug/admin surface; it is not a UI command system.
+Do not add HTTP routes for UI commands -- those belong on `SessionRouter` or `AppRouter`. Do not push large blobs through the WS message pipe -- those belong on plain HTTP endpoints. The `@command` framework is for the debug/admin surface; it is not a UI command system.
 
 ## Features
 
 - HMAC-SHA256 cookie authentication (session + identity tokens with expiry)
 - Generic session registry with singleton pattern and TTL cleanup
 - WebSocket transport with connection superseding and rate limiting
-- **`WSRouter`** -- FastAPI-style namespaced dispatch for WS messages, nestable via `include()`, auto-replies with `_req_id` matching
+- **`SessionRouter` / `AppRouter`** -- typed namespaced dispatch for WS messages, nestable via `include()`, auto-replies with `_req_id` matching
 - **JavaScript client** with auto-reconnect, heartbeat, and session-loss detection (framework-agnostic)
 - Declarative `@command` framework for the debug/admin surface, with auto-generated REST + MCP endpoints
 - Debug API with IP whitelisting, audit logging, and trusted proxy support
@@ -47,33 +48,43 @@ Do not add HTTP routes for UI commands -- those belong on `WSRouter`. Do not pus
 
 ## Quick Start
 
-### UI commands (`WSRouter`)
+### UI commands (`SessionRouter` / `AppRouter`)
 
-Namespaced dispatch for WS JSON messages. Each module owns a `WSRouter(prefix=...)`; assemble them into a root router and dispatch from your controller. Handlers may return a dict -- the router auto-replies on the same socket and forwards `_req_id` for request/response matching.
+Namespaced dispatch for WS JSON messages. Session handlers receive a typed
+session entry. App handlers receive a typed app context. A single Pydantic
+model parameter is parsed from the flat browser payload; a Pydantic return
+model is serialized as the reply payload.
 
 ```python
-# windows.py
-from llming_com import WSRouter
+from dataclasses import dataclass
+from pydantic import BaseModel
+from llming_com import BaseLlmingApp, BaseSessionEntry, SessionRouter, AppRouter
 
-router = WSRouter(prefix="windows")
+@dataclass
+class MySession(BaseSessionEntry):
+    count: int = 0
 
-@router.handler("list")
-async def list_windows(controller):
-    return {"windows": [...]}
+class IncEvent(BaseModel):
+    by: int = 1
 
-@router.handler("focus")
-async def focus(controller, window_id: str):
-    await controller.focus(window_id)
-    return {"ok": True}
+class CountResult(BaseModel):
+    ok: bool
+    value: int
 
-# app.py -- assemble and dispatch
-from llming_com import WSRouter
-root = WSRouter()
-root.include(router)            # → windows.list, windows.focus
-table = root.build_dispatch_table()
+counter = SessionRouter(prefix="counter")
 
-async def on_message(entry, msg):
-    await root.dispatch(msg["type"], msg, entry.controller, _table=table)
+@counter.handler("inc")
+async def inc(session: MySession, event: IncEvent) -> CountResult:
+    session.count += event.by
+    await session.call("home.setCounter", session.count)
+    return CountResult(ok=True, value=session.count)
+
+admin = AppRouter(prefix="admin")
+
+@admin.handler("broadcast")
+async def broadcast(app: BaseLlmingApp[MySession], message: str) -> dict:
+    sent = await app.broadcast("toast.show", message)
+    return {"ok": True, "sent": sent}
 ```
 
 ### Debug commands (`@command`)

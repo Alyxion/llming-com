@@ -6,16 +6,17 @@ Provides the communication infrastructure shared across llming applications:
 - **Session**: Base session entry and registry with TTL cleanup
 - **Transport**: WebSocket lifecycle management
 - **Controller**: Base controller with send, heartbeat, rate limiting
-- **WSRouter**: Namespaced dispatch for WebSocket JSON messages
+- **SessionRouter/AppRouter**: Typed namespaced dispatch for WebSocket JSON messages
 - **Debug**: Debug API router for session inspection
 - **DataStore**: Thread-safe in-memory session data store
 
 Transport policy
 ----------------
 
-All command and query traffic flows over the **WebSocket** via :class:`WSRouter`
-— FastAPI-style namespaced dispatch on the ``"type"`` field of the JSON
-message (e.g. ``{"type": "llmings.list"}``). One socket, one routing table.
+All command and query traffic flows over the **WebSocket** via
+:class:`SessionRouter` or :class:`AppRouter` — FastAPI-style namespaced
+dispatch on the ``"type"`` field of the JSON message
+(e.g. ``{"type": "llmings.list"}``). One socket, typed routing tables.
 
 **HTTP endpoints are reserved exclusively for large or static content that
 does not fit the WS model:** file uploads, blob downloads, static asset
@@ -40,13 +41,14 @@ from llming_com.command import (
 )
 from llming_com.command_router import build_command_router
 from llming_com.controller import BaseController
+from llming_com.app import BaseLlmingApp
 from llming_com.data_store import SessionDataStore
 from llming_com.debug import build_debug_router
 from llming_com.session import BaseSessionEntry, BaseSessionRegistry
 from llming_com.session_manager import ConnectionType, SessionContext, SessionManager
 from llming_com.server import LlmingMiddleware, error_response, mount_client_static
 from llming_com.transport import run_websocket_session
-from llming_com.ws_router import WSRouter
+from llming_com.ws_router import AppRouter, SessionRouter, WSRouter
 
 __all__ = [
     # Auth
@@ -58,12 +60,15 @@ __all__ = [
     # Session
     "BaseSessionEntry",
     "BaseSessionRegistry",
+    "BaseLlmingApp",
     # Transport
     "run_websocket_session",
     # Controller
     "BaseController",
     # WS message routing (see "Two routers" in README)
     "WSRouter",
+    "SessionRouter",
+    "AppRouter",
     # Debug
     "build_debug_router",
     # Commands

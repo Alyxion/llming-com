@@ -4,13 +4,12 @@ Provides ``BaseController`` with:
 - Safe JSON send over WebSocket
 - Rate limiting
 - Heartbeat handling
-- WSRouter dispatch (mounts a namespaced router so handlers like
+- SessionRouter/AppRouter dispatch (mounts namespaced routers so handlers like
   ``llmings.list`` are dispatched automatically before subclass overrides)
 """
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import time
@@ -23,7 +22,7 @@ class BaseController:
     """Minimal WebSocket controller with send, heartbeat, and rate limiting.
 
     Subclass to add domain-specific message handling. Supports automatic
-    dispatch via :class:`~llming_com.ws_router.WSRouter` for namespaced
+    dispatch via :class:`~llming_com.ws_router.SessionRouter` for namespaced
     commands (e.g. ``"llmings.list"``).
 
     Args:
@@ -44,7 +43,29 @@ class BaseController:
         self._rate_limit_window = rate_limit_window
         self._rate_limit_max = rate_limit_max
         self._request_timestamps: list[float] = []
-        self._ws_dispatch_table: Optional[dict] = None  # cached from WSRouter
+        self._ws_dispatch_table: Optional[dict] = None
+        self._app_dispatch_table: Optional[dict] = None
+        self.entry: Any | None = None
+        self.app: Any | None = None
+
+    @property
+    def session(self) -> Any | None:
+        """Alias for the session entry attached to this controller."""
+        return self.entry
+
+    @session.setter
+    def session(self, value: Any | None) -> None:
+        self.entry = value
+
+    def attach_session(self, entry: Any) -> None:
+        """Attach a session entry and mirror the controller on the entry."""
+        self.entry = entry
+        if entry is not None:
+            entry.controller = self
+
+    def attach_app(self, app: Any) -> None:
+        """Attach an application context to this controller."""
+        self.app = app
 
     def set_websocket(self, ws: Optional[Any]) -> None:
         """Set or clear the active WebSocket connection."""
@@ -81,22 +102,38 @@ class BaseController:
         return True
 
     def mount_router(self, router: Any) -> None:
-        """Mount a :class:`~llming_com.ws_router.WSRouter` for auto dispatch.
+        """Mount a session or app router for auto dispatch.
 
         Call once during setup. Messages whose ``"type"`` matches a route
         in the router (or any nested router) are handled automatically in
         :meth:`handle_message` before the subclass override is consulted.
         """
-        from llming_com.ws_router import WSRouter
-        if isinstance(router, WSRouter):
+        from llming_com.ws_router import AppRouter, SessionRouter
+        if isinstance(router, AppRouter):
+            self._app_dispatch_table = router.build_dispatch_table()
+        elif isinstance(router, SessionRouter):
             self._ws_dispatch_table = router.build_dispatch_table()
+
+    def mount_session_router(self, router: Any) -> None:
+        """Mount a session-scoped router."""
+        from llming_com.ws_router import SessionRouter
+        if not isinstance(router, SessionRouter):
+            raise TypeError("mount_session_router requires SessionRouter")
+        self._ws_dispatch_table = router.build_dispatch_table()
+
+    def mount_app_router(self, router: Any) -> None:
+        """Mount an app-scoped router."""
+        from llming_com.ws_router import AppRouter
+        if not isinstance(router, AppRouter):
+            raise TypeError("mount_app_router requires AppRouter")
+        self._app_dispatch_table = router.build_dispatch_table()
 
     async def handle_message(self, msg: dict) -> None:
         """Handle an incoming WebSocket message.
 
         Dispatch order:
         1. Heartbeat (built-in)
-        2. WSRouter dispatch table (namespaced commands like ``"llmings.list"``)
+        2. SessionRouter/AppRouter dispatch table (``"llmings.list"``)
         3. Subclass override (legacy / unstructured message types)
         """
         msg_type = msg.get("type", "")
@@ -104,34 +141,32 @@ class BaseController:
             await self.send({"type": "heartbeat_ack"})
             return
 
-        if self._ws_dispatch_table:
-            route = self._ws_dispatch_table.get(msg_type)
+        for table in (self._ws_dispatch_table, self._app_dispatch_table):
+            if not table:
+                continue
+            route = table.get(msg_type)
             if route:
-                kwargs: dict[str, Any] = {}
-                sig = inspect.signature(route.handler)
-                for pname in sig.parameters:
-                    if pname == "controller":
-                        kwargs["controller"] = self
-                    elif pname == "send":
-                        kwargs["send"] = self.send
-                    elif pname in msg:
-                        kwargs[pname] = msg[pname]
-                try:
-                    result = await route.handler(**kwargs)
-                    if result is not None:
-                        resp = {"type": msg_type, **result}
-                        if "_req_id" in msg:
-                            resp["_req_id"] = msg["_req_id"]
-                        await self.send(resp)
-                except Exception as exc:
-                    logger.error("WSRouter handler %s failed: %s", msg_type, exc)
-                    resp = {"type": msg_type, "error": str(exc)}
-                    if "_req_id" in msg:
-                        resp["_req_id"] = msg["_req_id"]
-                    await self.send(resp)
+                await self._handle_route(route, msg_type, msg)
                 return
 
         logger.debug("[CONTROLLER] Unhandled message type: %s", msg_type)
+
+    async def _handle_route(self, route: Any, msg_type: str, msg: dict) -> None:
+        from llming_com.ws_router import call_route, serialize_handler_result
+
+        try:
+            result = await call_route(route, msg, self)
+            if result is not None:
+                resp = {"type": msg_type, **serialize_handler_result(result)}
+                if "_req_id" in msg:
+                    resp["_req_id"] = msg["_req_id"]
+                await self.send(resp)
+        except Exception as exc:
+            logger.error("%s handler %s failed: %s", route.scope, msg_type, exc)
+            resp = {"type": msg_type, "error": str(exc)}
+            if "_req_id" in msg:
+                resp["_req_id"] = msg["_req_id"]
+            await self.send(resp)
 
     async def cleanup(self) -> None:
         """Clean up resources when the session disconnects.
