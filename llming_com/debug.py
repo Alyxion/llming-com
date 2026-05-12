@@ -36,6 +36,8 @@ def build_debug_router(
     allowed_networks: list[str] | None = None,
     trusted_proxies: list[str] | None = None,
     allowed_message_types: list[str] | None = None,
+    session_filter: Optional[Callable[[BaseSessionEntry], bool]] = None,
+    connection_target: Optional[Callable[[BaseSessionEntry], object | None]] = None,
     session_detail_hook: Optional[
         Callable[[str, BaseSessionEntry], dict | Awaitable[dict]]
     ] = None,
@@ -58,6 +60,10 @@ def build_debug_router(
             X-Forwarded-For is used to determine the real client IP.
         allowed_message_types: If set, only these message types can be
             forwarded via ws_send. None means all types allowed.
+        session_filter: Optional predicate for app-specific debug routers that
+            share the central registry but only expose their own session type.
+        connection_target: Optional object that owns websocket/controller for
+            app-specific sessions stored as attachments.
         session_detail_hook: Called with (session_id, entry) to add
             domain-specific fields to the session detail response.
             Can be sync or async.
@@ -117,11 +123,15 @@ def build_debug_router(
         now = time.monotonic()
         result = []
         for sid, entry in sessions.items():
+            if session_filter and not session_filter(entry):
+                continue
+            target = connection_target(entry) if connection_target else entry
+            websocket = target.websocket if target is not None else None
             result.append({
                 "session_id": sid,
                 "user_id": entry.user_id,
                 "user_name": entry.user_name,
-                "ws_connected": entry.websocket is not None,
+                "ws_connected": websocket is not None,
                 "idle_seconds": round(now - entry.last_activity),
                 "created_seconds_ago": round(now - entry.created_at),
             })
@@ -131,16 +141,18 @@ def build_debug_router(
     @router.get("/sessions/{session_id}")
     async def get_session(session_id: str):
         entry = registry.get_session(session_id)
-        if not entry:
+        if not entry or (session_filter and not session_filter(entry)):
             raise HTTPException(404, f"Session {session_id} not found")
 
         now = time.monotonic()
+        target = connection_target(entry) if connection_target else entry
+        websocket = target.websocket if target is not None else None
         result = {
             "session_id": session_id,
             "user_id": entry.user_id,
             "user_name": entry.user_name,
             "user_email": entry.user_email,
-            "ws_connected": entry.websocket is not None,
+            "ws_connected": websocket is not None,
             "idle_seconds": round(now - entry.last_activity),
             "created_seconds_ago": round(now - entry.created_at),
         }
@@ -161,9 +173,10 @@ def build_debug_router(
     async def ws_send(session_id: str, request: Request):
         """Forward an arbitrary JSON message through the session's WS handler."""
         entry = registry.get_session(session_id)
-        if not entry:
+        if not entry or (session_filter and not session_filter(entry)):
             raise HTTPException(404, f"Session {session_id} not found")
-        if not entry.controller:
+        target = connection_target(entry) if connection_target else entry
+        if target is None or not target.controller:
             raise HTTPException(400, "Session has no controller")
 
         data = await request.json()
@@ -183,7 +196,7 @@ def build_debug_router(
             data.get("type", "<none>"),
         )
 
-        await entry.controller.handle_message(data)
+        await target.controller.handle_message(data)
         return {"ok": True, "forwarded": data.get("type", "")}
 
     # ── Extra routes ──────────────────────────────────────────

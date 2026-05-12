@@ -20,19 +20,19 @@ from llming_com.session_manager import (
 
 
 @dataclass
-class TestEntry(BaseSessionEntry):
+class SampleEntry(BaseSessionEntry):
     custom_field: str = ""
 
 
-class TestRegistry(BaseSessionRegistry["TestEntry"]):
+class SampleRegistry(BaseSessionRegistry["SampleEntry"]):
     pass
 
 
 @pytest.fixture(autouse=True)
 def reset_registry():
-    TestRegistry.reset()
+    SampleRegistry.reset()
     yield
-    TestRegistry.reset()
+    SampleRegistry.reset()
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def auth():
 
 @pytest.fixture
 def registry():
-    return TestRegistry.get()
+    return SampleRegistry.get()
 
 
 @pytest.fixture
@@ -54,7 +54,7 @@ def manager(registry, auth):
 
 
 def test_create_session_basic(manager):
-    entry = TestEntry(user_id="viewer")
+    entry = SampleEntry(user_id="viewer")
     session_id, token = manager.create_session(entry)
 
     assert len(session_id) > 10
@@ -63,7 +63,7 @@ def test_create_session_basic(manager):
 
 
 def test_create_session_with_context(manager):
-    entry = TestEntry(user_id="guest")
+    entry = SampleEntry(user_id="guest")
     ctx = SessionContext(
         connection_type=ConnectionType.PROXY,
         user_email="guest@example.com",
@@ -80,13 +80,13 @@ def test_create_session_with_context(manager):
 
 
 def test_create_session_explicit_id(manager):
-    entry = TestEntry(user_id="viewer")
+    entry = SampleEntry(user_id="viewer")
     session_id, _ = manager.create_session(entry, session_id="my-custom-id")
     assert session_id == "my-custom-id"
 
 
 def test_create_session_default_context(manager):
-    entry = TestEntry(user_id="viewer")
+    entry = SampleEntry(user_id="viewer")
     session_id, _ = manager.create_session(entry)
     ctx = manager.get_context(session_id)
     assert ctx is not None
@@ -97,7 +97,7 @@ def test_create_session_default_context(manager):
 
 
 def test_resolve_from_cookie(manager, auth):
-    entry = TestEntry(user_id="viewer")
+    entry = SampleEntry(user_id="viewer")
     session_id, token = manager.create_session(entry)
 
     request = _FakeRequest({"llming_auth": token})
@@ -108,7 +108,7 @@ def test_resolve_from_cookie(manager, auth):
 
 
 def test_resolve_missing_cookie(manager):
-    entry = TestEntry(user_id="viewer")
+    entry = SampleEntry(user_id="viewer")
     manager.create_session(entry)
 
     request = _FakeRequest({})
@@ -119,7 +119,7 @@ def test_resolve_missing_cookie(manager):
 
 
 def test_resolve_invalid_cookie(manager):
-    entry = TestEntry(user_id="viewer")
+    entry = SampleEntry(user_id="viewer")
     manager.create_session(entry)
 
     request = _FakeRequest({"llming_auth": "invalid.token.here"})
@@ -128,7 +128,7 @@ def test_resolve_invalid_cookie(manager):
 
 
 def test_resolve_expired_session(manager, auth, registry):
-    entry = TestEntry(user_id="viewer")
+    entry = SampleEntry(user_id="viewer")
     session_id, token = manager.create_session(entry)
     registry.remove(session_id)
 
@@ -143,7 +143,7 @@ def test_resolve_expired_session(manager, auth, registry):
 
 @pytest.mark.asyncio
 async def test_end_session(manager):
-    entry = TestEntry(user_id="viewer")
+    entry = SampleEntry(user_id="viewer")
     session_id, _ = manager.create_session(entry)
     assert manager.active_count == 1
 
@@ -162,9 +162,9 @@ async def test_end_session_nonexistent(manager):
 
 
 def test_sessions_by_type(manager):
-    lan_entry = TestEntry(user_id="local")
-    proxy_entry = TestEntry(user_id="remote")
-    p2p_entry = TestEntry(user_id="mobile")
+    lan_entry = SampleEntry(user_id="local")
+    proxy_entry = SampleEntry(user_id="remote")
+    p2p_entry = SampleEntry(user_id="mobile")
 
     manager.create_session(lan_entry, context=SessionContext(connection_type=ConnectionType.LAN))
     manager.create_session(proxy_entry, context=SessionContext(connection_type=ConnectionType.PROXY))
@@ -180,9 +180,9 @@ def test_sessions_by_type(manager):
 
 
 def test_sessions_by_user(manager):
-    e1 = TestEntry(user_id="u1")
-    e2 = TestEntry(user_id="u2")
-    e3 = TestEntry(user_id="u1")
+    e1 = SampleEntry(user_id="u1")
+    e2 = SampleEntry(user_id="u2")
+    e3 = SampleEntry(user_id="u1")
 
     manager.create_session(e1, context=SessionContext(user_email="a@test.com"))
     manager.create_session(e2, context=SessionContext(user_email="b@test.com"))
@@ -196,8 +196,8 @@ def test_sessions_by_user(manager):
 
 
 def test_active_contexts(manager):
-    e1 = TestEntry(user_id="u1")
-    e2 = TestEntry(user_id="u2")
+    e1 = SampleEntry(user_id="u1")
+    e2 = SampleEntry(user_id="u2")
 
     sid1, _ = manager.create_session(e1, context=SessionContext(connection_type=ConnectionType.LAN))
     sid2, _ = manager.create_session(e2, context=SessionContext(connection_type=ConnectionType.PROXY))
@@ -212,9 +212,9 @@ def test_active_contexts(manager):
 
 
 def test_revoke_by_connection_type(manager):
-    e1 = TestEntry(user_id="u1")
-    e2 = TestEntry(user_id="u2")
-    e3 = TestEntry(user_id="u3")
+    e1 = SampleEntry(user_id="u1")
+    e2 = SampleEntry(user_id="u2")
+    e3 = SampleEntry(user_id="u3")
 
     manager.create_session(e1, context=SessionContext(connection_type=ConnectionType.SHARE))
     manager.create_session(e2, context=SessionContext(connection_type=ConnectionType.SHARE))
@@ -226,8 +226,8 @@ def test_revoke_by_connection_type(manager):
 
 
 def test_revoke_by_user(manager):
-    e1 = TestEntry(user_id="u1")
-    e2 = TestEntry(user_id="u2")
+    e1 = SampleEntry(user_id="u1")
+    e2 = SampleEntry(user_id="u2")
 
     manager.create_session(e1, context=SessionContext(user_email="guest@test.com"))
     manager.create_session(e2, context=SessionContext(user_email="owner@test.com"))
@@ -238,8 +238,8 @@ def test_revoke_by_user(manager):
 
 
 def test_revoke_by_target(manager):
-    e1 = TestEntry(user_id="u1")
-    e2 = TestEntry(user_id="u2")
+    e1 = SampleEntry(user_id="u1")
+    e2 = SampleEntry(user_id="u2")
 
     manager.create_session(e1, context=SessionContext(target_id="host-A"))
     manager.create_session(e2, context=SessionContext(target_id="host-B"))
@@ -252,8 +252,8 @@ def test_revoke_by_target(manager):
 
 
 def test_cleanup_expired_contexts(manager, registry):
-    e1 = TestEntry(user_id="u1")
-    e2 = TestEntry(user_id="u2")
+    e1 = SampleEntry(user_id="u1")
+    e2 = SampleEntry(user_id="u2")
 
     sid1, _ = manager.create_session(e1)
     sid2, _ = manager.create_session(e2)
@@ -271,7 +271,7 @@ def test_cleanup_expired_contexts(manager, registry):
 
 
 def test_share_session(manager):
-    entry = TestEntry(user_id="guest-sarah")
+    entry = SampleEntry(user_id="guest-sarah")
     ctx = SessionContext(
         connection_type=ConnectionType.SHARE,
         user_display_name="Sarah",

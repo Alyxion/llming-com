@@ -7,6 +7,7 @@ and debug API. Run with:
 """
 
 import json
+import os
 from dataclasses import dataclass
 
 from fastapi import FastAPI, WebSocket
@@ -14,9 +15,10 @@ from fastapi.responses import JSONResponse
 
 from llming_com import (
     AuthManager,
-    BaseSessionEntry,
-    BaseSessionRegistry,
     build_debug_router,
+    LlmingSession,
+    LlmingSessionData,
+    LlmingSessions,
     run_websocket_session,
 )
 
@@ -24,19 +26,17 @@ from llming_com import (
 
 
 @dataclass
-class EchoEntry(BaseSessionEntry):
-    """Session that tracks how many messages were echoed."""
+class EchoState(LlmingSessionData):
+    """Echo-specific state attached to the central session."""
+
     echo_count: int = 0
-
-
-class EchoRegistry(BaseSessionRegistry["EchoEntry"]):
-    pass
 
 
 # ── App ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="LLMing-Com Echo Server")
-registry = EchoRegistry.get()
+registry = LlmingSessions.registry()
+os.environ.setdefault("LLMING_AUTH_SECRET", "demo")
 # Per-app AuthManager so cookies don't collide with other llming-com apps
 # sharing the same domain.
 auth = AuthManager(app_name="echo")
@@ -46,7 +46,7 @@ auth = AuthManager(app_name="echo")
 async def create_session(user_id: str = "anonymous"):
     """Create a new session and return the session ID."""
     session_id, token = auth.make_auth_cookie_value()
-    entry = EchoEntry(user_id=user_id)
+    entry = LlmingSession(user_id=user_id)
     registry.register(session_id, entry)
     return JSONResponse({
         "session_id": session_id,
@@ -60,21 +60,27 @@ async def ws_endpoint(websocket: WebSocket, session_id: str):
     """WebSocket endpoint that echoes messages back."""
 
     async def on_connect(entry, ws):
+        await EchoState.current()
         await ws.send_text(json.dumps({
             "type": "connected",
             "user_id": entry.user_id,
         }))
 
     async def on_message(entry, msg):
-        entry.echo_count += 1
+        echo = await EchoState.current()
+        if echo is None:
+            return
+        echo.echo_count += 1
         await entry.websocket.send_text(json.dumps({
             "type": "echo",
             "original": msg,
-            "echo_count": entry.echo_count,
+            "echo_count": echo.echo_count,
         }))
 
     async def on_disconnect(sid, entry):
-        print(f"[{sid[:8]}] Disconnected after {entry.echo_count} messages")
+        echo = await EchoState.current()
+        count = echo.echo_count if echo is not None else 0
+        print(f"[{sid[:8]}] Disconnected after {count} messages")
 
     await run_websocket_session(
         websocket, session_id, registry,
@@ -90,6 +96,12 @@ debug_router = build_debug_router(
     registry,
     api_key_env="ECHO_DEBUG_KEY",
     prefix="/debug",
-    session_detail_hook=lambda sid, e: {"echo_count": e.echo_count},
+    session_detail_hook=lambda sid, e: {
+        "echo_count": (
+            e.optional_data(EchoState).echo_count
+            if e.optional_data(EchoState) is not None
+            else 0
+        ),
+    },
 )
 app.include_router(debug_router)

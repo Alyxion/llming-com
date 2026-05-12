@@ -121,8 +121,10 @@ class LlmingMiddleware(BaseHTTPMiddleware):
         self._on_error = on_error
 
     async def dispatch(self, request: Request, call_next) -> Response:
+        from llming_com.session import LlmingSessions
         try:
-            return await call_next(request)
+            with LlmingSessions.bind(request=request):
+                return await call_next(request)
         except Exception as exc:
             if self._on_error:
                 custom = self._on_error(request, exc)

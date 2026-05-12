@@ -1,11 +1,19 @@
 """Tests for llming_com.session -- BaseSessionEntry and BaseSessionRegistry."""
 
+import asyncio
+import gc
 import time
 from dataclasses import dataclass
 
 import pytest
 
-from llming_com.session import BaseSessionEntry, BaseSessionRegistry
+from llming_com.session import (
+    BaseSessionEntry,
+    BaseSessionRegistry,
+    LlmingSession,
+    LlmingSessionData,
+    _pending_cleanup_tasks,
+)
 
 
 # ── Custom subclasses for testing ──────────────────────────────────────
@@ -67,6 +75,48 @@ class TestBaseSessionEntry:
         assert before <= e.created_at <= after
         assert before <= e.last_activity <= after
         assert before <= e.last_heartbeat <= after
+
+
+@dataclass
+class SampleSessionData(LlmingSessionData):
+    value: str = "default"
+
+    @classmethod
+    async def create(cls, session: LlmingSession, context=None) -> "SampleSessionData":
+        if isinstance(context, str):
+            return cls(value=context)
+        return cls(value=session.user_id)
+
+
+class TestLlmingSessionData:
+    @pytest.mark.asyncio
+    async def test_current_uses_active_session(self):
+        session = LlmingSession(user_id="u1")
+        with session.active():
+            data = await SampleSessionData.current(context="created")
+
+        assert data is not None
+        assert data.value == "created"
+        assert session.optional_data(SampleSessionData) is data
+
+    @pytest.mark.asyncio
+    async def test_current_returns_existing_attachment(self):
+        session = LlmingSession(user_id="u1")
+        with session.active():
+            first = await SampleSessionData.current(context="first")
+            second = await SampleSessionData.current(context="second")
+
+        assert first is second
+        assert second is not None
+        assert second.value == "first"
+
+    @pytest.mark.asyncio
+    async def test_current_can_use_explicit_session(self):
+        session = LlmingSession(user_id="explicit")
+        data = await SampleSessionData.current(session=session)
+
+        assert data is not None
+        assert data.value == "explicit"
 
 
 # ── BaseSessionRegistry tests ──────────────────────────────────────────
@@ -416,3 +466,95 @@ class TestZombieSessionCleanup:
         await BaseSessionRegistry._close_zombie(entry)
         # controller cleanup still runs
         assert entry.controller.cleaned_up
+
+
+# ── Attachment cleanup task tests ──────────────────────────────────────
+
+
+@dataclass
+class _TrackingAttachment(LlmingSessionData):
+    """Attachment that records when its cleanup() is awaited."""
+
+    cleaned: asyncio.Event = None  # type: ignore[assignment]
+
+    async def cleanup(self) -> None:
+        await asyncio.sleep(0)
+        if self.cleaned is not None:
+            self.cleaned.set()
+
+
+class TestAttachmentCleanupRetention:
+    """``cleanup_runtime`` must keep cleanup task refs so GC can't cancel them."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_task_runs_to_completion(self):
+        """The fire-and-forget cleanup task is retained and actually finishes."""
+        session = LlmingSession(user_id="u1")
+        attachment = _TrackingAttachment(cleaned=asyncio.Event())
+        session.attach_data(attachment)
+
+        before = len(_pending_cleanup_tasks)
+        session.cleanup_runtime()
+        # Task should be retained in the module-level set right away.
+        assert len(_pending_cleanup_tasks) == before + 1
+
+        # GC the local attachment reference; the task must survive.
+        del attachment
+        gc.collect()
+
+        await asyncio.wait_for(
+            asyncio.gather(*list(_pending_cleanup_tasks)), timeout=1.0
+        )
+        # Done callback should remove the task from the set.
+        assert len(_pending_cleanup_tasks) == before
+
+    @pytest.mark.asyncio
+    async def test_cleanup_attachment_event_fires(self):
+        session = LlmingSession(user_id="u1")
+        cleaned = asyncio.Event()
+        session.attach_data(_TrackingAttachment(cleaned=cleaned))
+
+        session.cleanup_runtime()
+        await asyncio.wait_for(cleaned.wait(), timeout=1.0)
+
+
+class TestLlmingSessionDataTransportFields:
+    """``LlmingSessionData`` exposes websocket/controller slots for transport."""
+
+    def test_subclass_can_serve_as_connection_target(self):
+        @dataclass
+        class HubData(LlmingSessionData):
+            pass
+
+            @classmethod
+            async def create(cls, session, context=None):
+                return cls()
+
+        data = HubData()
+        assert data.websocket is None
+        assert data.controller is None
+        # Transport assigns directly onto the attachment.
+        data.websocket = "ws-sentinel"
+        data.controller = "ctrl-sentinel"
+        assert data.websocket == "ws-sentinel"
+        assert data.controller == "ctrl-sentinel"
+
+
+class TestResetCancelsCleanupLoop:
+    """``BaseSessionRegistry.reset`` cancels any running cleanup task."""
+
+    @pytest.mark.asyncio
+    async def test_reset_cancels_running_cleanup_task(self):
+        SampleRegistry.reset()
+        reg = SampleRegistry.get()
+        reg.start_cleanup_loop(interval=0.01)
+        task = BaseSessionRegistry._global_cleanup_task
+        assert task is not None
+        assert not task.done()
+
+        SampleRegistry.reset()
+        # Give the event loop a tick to process the cancellation.
+        with pytest.raises((asyncio.CancelledError, RuntimeError)):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert task.cancelled() or task.done()
+        assert BaseSessionRegistry._global_cleanup_task is None

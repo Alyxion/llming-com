@@ -8,23 +8,23 @@ Then open http://localhost:8001 in a browser.
 
 import datetime
 import json
-import secrets
+import os
 import time
 from dataclasses import dataclass, field
 
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 
 from llming_com import (
-    AuthManager,
     BaseController,
-    BaseSessionEntry,
-    BaseSessionRegistry,
     SessionDataStore,
     build_debug_router,
     command,
     CommandScope,
+    LlmingSession,
+    LlmingSessionData,
+    LlmingSessions,
     get_auth,
     get_default_command_registry,
     mount_client_static,
@@ -33,20 +33,16 @@ from llming_com import (
     SESSION_COOKIE_NAME,
 )
 
-# ── Session entry with custom fields ────────────────────────────
+# ── Typed data attached to the central session ──────────────────
 
 
 @dataclass
-class DemoSessionEntry(BaseSessionEntry):
+class DemoSessionData(LlmingSessionData):
     nickname: str = ""
     connected_at: str = ""
 
 
-class DemoRegistry(BaseSessionRegistry["DemoSessionEntry"]):
-    pass
-
-
-registry = DemoRegistry.get()
+registry = LlmingSessions.registry()
 
 # ── Commands ────────────────────────────────────────────────────
 
@@ -57,19 +53,23 @@ async def cmd_ping():
 
 
 @command("set_nickname", description="Set your display nickname", scope=CommandScope.SESSION)
-async def cmd_set_nickname(entry: DemoSessionEntry, controller: BaseController, nickname: str):
-    entry.nickname = nickname
+async def cmd_set_nickname(entry: LlmingSession, controller: BaseController, nickname: str):
+    data = await DemoSessionData.current(session=entry)
+    if data is None:
+        return {"status": "error", "message": "no active session"}
+    data.nickname = nickname
     await controller.send({"type": "nickname_set", "nickname": nickname})
     return {"status": "ok", "nickname": nickname}
 
 
 @command("get_status", description="Get current session status", scope=CommandScope.SESSION)
-async def cmd_get_status(session_id: str, entry: DemoSessionEntry):
+async def cmd_get_status(session_id: str, entry: LlmingSession):
+    data = await DemoSessionData.current(session=entry)
     return {
         "session_id": session_id[:8] + "...",
         "user_id": entry.user_id,
-        "nickname": entry.nickname,
-        "connected_at": entry.connected_at,
+        "nickname": data.nickname if data else "",
+        "connected_at": data.connected_at if data else "",
         "ws_connected": entry.websocket is not None,
     }
 
@@ -79,19 +79,21 @@ async def cmd_list_users():
     sessions = registry.list_sessions()
     users = []
     for sid, entry in sessions.items():
+        data = entry.optional_data(DemoSessionData) if isinstance(entry, LlmingSession) else None
         users.append({
             "session_id": sid[:8] + "...",
             "user_id": entry.user_id,
-            "nickname": entry.nickname or "(none)",
-            "connected_at": entry.connected_at,
+            "nickname": data.nickname if data and data.nickname else "(none)",
+            "connected_at": data.connected_at if data else "",
             "online": entry.websocket is not None,
         })
     return {"users": users, "total": len(users)}
 
 
 @command("broadcast", description="Send a message to all connected users", scope=CommandScope.SESSION)
-async def cmd_broadcast(entry: DemoSessionEntry, controller: BaseController, text: str):
-    sender = entry.nickname or entry.user_id
+async def cmd_broadcast(entry: LlmingSession, controller: BaseController, text: str):
+    data = await DemoSessionData.current(session=entry)
+    sender = data.nickname if data and data.nickname else entry.user_id
     count = 0
     for sid, other in registry.list_sessions().items():
         if other.websocket is not None:
@@ -122,15 +124,17 @@ async def cmd_save_note(session_id: str, controller: BaseController, text: str):
 cmd_registry = get_default_command_registry()
 
 
-async def on_connect(entry: DemoSessionEntry, websocket: WebSocket):
+async def on_connect(entry: LlmingSession, websocket: WebSocket):
     ctrl = BaseController(session_id="demo")
     ctrl.set_websocket(websocket)
     entry.controller = ctrl
-    entry.connected_at = datetime.datetime.now().isoformat(timespec="seconds")
+    data = await DemoSessionData.current()
+    if data is not None:
+        data.connected_at = datetime.datetime.now().isoformat(timespec="seconds")
     await ctrl.send({"type": "welcome", "message": "Connected to llming-com demo"})
 
 
-async def on_message(entry: DemoSessionEntry, msg: dict):
+async def on_message(entry: LlmingSession, msg: dict):
     ctrl: BaseController = entry.controller
     msg_type = msg.get("type", "")
 
@@ -164,7 +168,7 @@ async def on_message(entry: DemoSessionEntry, msg: dict):
     await ctrl.send({"type": "echo", "original": msg})
 
 
-async def on_disconnect(session_id: str, entry: DemoSessionEntry):
+async def on_disconnect(session_id: str, entry: LlmingSession):
     ns = f"session:{session_id}:notes"
     SessionDataStore.clear_namespace(ns)
 
@@ -172,11 +176,11 @@ async def on_disconnect(session_id: str, entry: DemoSessionEntry):
 # ── FastAPI app ─────────────────────────────────────────────────
 
 app = FastAPI(title="llming-com demo")
+os.environ.setdefault("LLMING_AUTH_SECRET", "demo")
 auth = get_auth()
 mount_client_static(app)
 
 # Debug router
-import os
 os.environ.setdefault("DEBUG_API_KEY", "demo-debug-key")
 app.include_router(build_debug_router(registry, allowed_networks=["*"]))
 
@@ -195,10 +199,7 @@ async def index(request: Request):
 async def ws_endpoint(websocket: WebSocket, session_id: str):
     # Register session on first WS connect (not on page load — avoids ghost sessions)
     if not registry.get_session(session_id):
-        entry = DemoSessionEntry(
-            user_id=f"user_{session_id[:6]}", nickname="",
-            connected_at=datetime.datetime.now().isoformat(timespec="seconds"),
-        )
+        entry = LlmingSession(user_id=f"user_{session_id[:6]}")
         registry.register(session_id, entry)
     await run_websocket_session(
         websocket,

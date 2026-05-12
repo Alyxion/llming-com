@@ -129,6 +129,8 @@ def _mount_command(
                 entry = session_registry.get_session(session_id)
                 if not entry:
                     raise HTTPException(404, f"Session {session_id} not found")
+                if cmd.app and entry.app_type != cmd.app:
+                    raise HTTPException(404, f"Session {session_id} not found")
                 if cmd.requires_websocket and not entry.websocket:
                     raise HTTPException(409, "No WebSocket connected")
                 inject["session_id"] = session_id

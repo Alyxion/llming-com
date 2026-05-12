@@ -11,11 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from llming_com.session import BaseSessionEntry, BaseSessionRegistry
+from llming_com.session import LlmingSession, LlmingSessions
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,8 @@ async def run_websocket_session(
     on_connect: Optional[Callable[[BaseSessionEntry, WebSocket], Awaitable[None]]] = None,
     on_message: Callable[[BaseSessionEntry, dict], Awaitable[None]],
     on_disconnect: Optional[Callable[[str, BaseSessionEntry], Awaitable[None]]] = None,
+    session_filter: Optional[Callable[[BaseSessionEntry], bool]] = None,
+    connection_target: Optional[Callable[[BaseSessionEntry], Any | None]] = None,
     supersede_existing: bool = True,
     max_message_size: int = 16 * 1024 * 1024,
     rate_limit: int = 100,
@@ -50,6 +53,10 @@ async def run_websocket_session(
         on_connect: Called after accept with (entry, websocket).
         on_message: Called for each valid JSON message with (entry, msg_dict).
         on_disconnect: Called on disconnect with (session_id, entry).
+        session_filter: Optional predicate that rejects sessions owned by a
+            different app when multiple apps share the central registry.
+        connection_target: Optional object that owns websocket/controller for
+            this app connection. Defaults to the root session entry.
         supersede_existing: If True, close any existing WebSocket for this
             session before accepting the new one.
         max_message_size: Maximum message size in bytes (default 16 MB).
@@ -58,66 +65,88 @@ async def run_websocket_session(
         log_prefix: Prefix for log messages.
     """
     entry = registry.get_session(session_id)
-    if not entry:
+    if not entry or (session_filter and not session_filter(entry)):
+        await websocket.close(code=4004, reason="Session not found")
+        return
+    target = connection_target(entry) if connection_target else entry
+    if target is None:
         await websocket.close(code=4004, reason="Session not found")
         return
 
     sid_short = session_id[:8]
 
     # Supersede existing connection
-    if supersede_existing and entry.websocket is not None:
+    if supersede_existing and target.websocket is not None:
         try:
-            await entry.websocket.close(code=4001, reason="Superseded by new connection")
+            await target.websocket.close(code=4001, reason="Superseded by new connection")
         except Exception:
             pass
-        if entry.controller:
+        if target.controller:
             try:
-                await entry.controller.cleanup()
+                await target.controller.cleanup()
             except Exception:
                 pass
 
     await websocket.accept()
-    entry.websocket = websocket
+    target.websocket = websocket
+    if target is not entry:
+        # Keep the central session aware of the active connection so the
+        # heartbeat reaper in BaseSessionRegistry.cleanup_expired can detect
+        # zombies even when an app routes the WS onto an attachment.
+        entry.websocket = websocket
     entry.last_heartbeat = time.monotonic()
     logger.info("[%s] Connected: %s...", log_prefix, sid_short)
 
     # Transport-level rate limiting state
     _msg_timestamps: list[float] = []
 
+    bound_session = entry if isinstance(entry, LlmingSession) else None
+
     try:
-        if on_connect:
-            await on_connect(entry, websocket)
+        with LlmingSessions.bind(session=bound_session):
+            if on_connect:
+                await on_connect(entry, websocket)
 
-        # Message loop
-        while True:
-            raw = await websocket.receive_text()
-            if max_message_size and len(raw) > max_message_size:
-                logger.warning(
-                    "[%s] Message too large (%d bytes) from %s...",
-                    log_prefix, len(raw), sid_short,
-                )
-                continue
-
-            # Transport-level rate limiting
-            now = time.monotonic()
-            _msg_timestamps[:] = [t for t in _msg_timestamps if now - t < rate_window]
-            if len(_msg_timestamps) >= rate_limit:
-                logger.warning(
-                    "[%s] Rate limit exceeded for %s...",
-                    log_prefix, sid_short,
-                )
-                continue
-            _msg_timestamps.append(now)
-
-            try:
-                msg = json.loads(raw)
-                if not isinstance(msg, dict):
+            # Message loop
+            while True:
+                raw = await websocket.receive_text()
+                if max_message_size and len(raw) > max_message_size:
+                    logger.warning(
+                        "[%s] Message too large (%d bytes) from %s...",
+                        log_prefix, len(raw), sid_short,
+                    )
                     continue
-                if msg.get("type") == "heartbeat":
-                    entry.last_heartbeat = time.monotonic()
-                await on_message(entry, msg)
-            except json.JSONDecodeError:
-                logger.warning("[%s] Invalid JSON from %s...", log_prefix, sid_short)
+
+                # Transport-level rate limiting
+                now = time.monotonic()
+                _msg_timestamps[:] = [t for t in _msg_timestamps if now - t < rate_window]
+                if len(_msg_timestamps) >= rate_limit:
+                    logger.warning(
+                        "[%s] Rate limit exceeded for %s...",
+                        log_prefix, sid_short,
+                    )
+                    continue
+                _msg_timestamps.append(now)
+
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("[%s] Invalid JSON from %s...", log_prefix, sid_short)
+                    continue
+
+                try:
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("type") == "heartbeat":
+                        entry.last_heartbeat = time.monotonic()
+                    await on_message(entry, msg)
+                except Exception as _msg_err:
+                    # Isolate per-message errors so one bad handler doesn't kill
+                    # the whole WS session for the user.
+                    logger.exception(
+                        "[%s] Unhandled error in on_message (type=%s): %s",
+                        log_prefix, msg.get("type", "?"), _msg_err,
+                    )
 
     except WebSocketDisconnect:
         logger.info("[%s] Disconnected: %s...", log_prefix, sid_short)
@@ -126,7 +155,10 @@ async def run_websocket_session(
     finally:
         if on_disconnect:
             try:
-                await on_disconnect(session_id, entry)
+                with LlmingSessions.bind(session=bound_session):
+                    await on_disconnect(session_id, entry)
             except Exception as e:
                 logger.warning("[%s] Disconnect hook error: %s", log_prefix, e)
-        entry.websocket = None
+        target.websocket = None
+        if target is not entry:
+            entry.websocket = None

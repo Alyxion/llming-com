@@ -44,7 +44,14 @@ from llming_com.controller import BaseController
 from llming_com.app import BaseLlmingApp
 from llming_com.data_store import SessionDataStore
 from llming_com.debug import build_debug_router
-from llming_com.session import BaseSessionEntry, BaseSessionRegistry
+from llming_com.session import (
+    BaseSessionEntry,
+    BaseSessionRegistry,
+    LlmingPrincipal,
+    LlmingSession,
+    LlmingSessionData,
+    LlmingSessions,
+)
 from llming_com.session_manager import ConnectionType, SessionContext, SessionManager
 from llming_com.server import LlmingMiddleware, error_response, mount_client_static
 from llming_com.transport import run_websocket_session
@@ -60,6 +67,10 @@ __all__ = [
     # Session
     "BaseSessionEntry",
     "BaseSessionRegistry",
+    "LlmingPrincipal",
+    "LlmingSession",
+    "LlmingSessionData",
+    "LlmingSessions",
     "BaseLlmingApp",
     # Transport
     "run_websocket_session",

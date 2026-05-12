@@ -2,12 +2,19 @@
 
 import asyncio
 import json
-from dataclasses import dataclass
+import time
+import typing
+from dataclasses import dataclass, field
 from typing import Optional
 
 import pytest
 
-from llming_com.session import BaseSessionEntry, BaseSessionRegistry
+from llming_com.session import (
+    BaseSessionEntry,
+    BaseSessionRegistry,
+    LlmingSession,
+    LlmingSessionData,
+)
 from llming_com.transport import run_websocket_session
 
 
@@ -54,6 +61,15 @@ class SampleEntry(BaseSessionEntry):
 
 class SampleReg(BaseSessionRegistry["SampleEntry"]):
     pass
+
+
+@dataclass
+class TransportState(LlmingSessionData):
+    events: list[str] = field(default_factory=list)
+
+    @classmethod
+    async def create(cls, session: LlmingSession, context=None) -> "TransportState":
+        return cls(events=[])
 
 
 @pytest.fixture(autouse=True)
@@ -289,6 +305,39 @@ class TestEndToEnd:
     """Full lifecycle: connect → exchange messages → disconnect."""
 
     @pytest.mark.asyncio
+    async def test_lifecycle_binds_central_session_context(self):
+        reg = BaseSessionRegistry[LlmingSession].get()
+        entry = LlmingSession(user_id="user-42")
+        reg.register("session-ctx", entry)
+
+        async def on_connect(e, ws):
+            state = await TransportState.current()
+            assert state is not None
+            state.events.append("connect")
+
+        async def on_message(e, msg):
+            state = await TransportState.current()
+            assert state is not None
+            state.events.append(msg["type"])
+
+        async def on_disconnect(sid, e):
+            state = await TransportState.current()
+            assert state is not None
+            state.events.append("disconnect")
+
+        ws = MockWebSocket(['{"type": "one"}'])
+        await run_websocket_session(
+            ws, "session-ctx", reg,
+            on_connect=on_connect,
+            on_message=on_message,
+            on_disconnect=on_disconnect,
+        )
+
+        state = entry.optional_data(TransportState)
+        assert state is not None
+        assert state.events == ["connect", "one", "disconnect"]
+
+    @pytest.mark.asyncio
     async def test_full_session_lifecycle(self):
         reg = SampleReg.get()
         entry = SampleEntry(user_id="user-42", custom="hello")
@@ -336,3 +385,95 @@ class TestEndToEnd:
         assert reply1["text"] == "hello"
         reply2 = json.loads(ws.sent[2])
         assert reply2["text"] == "world"
+
+
+class TestRunWebsocketSessionTypeHints:
+    """``run_websocket_session`` must have resolvable annotations."""
+
+    def test_get_type_hints_resolves(self):
+        # Would raise ``NameError: Any`` if the typing import is incomplete.
+        hints = typing.get_type_hints(run_websocket_session)
+        assert "connection_target" in hints
+
+
+@dataclass
+class _AppConnection(LlmingSessionData):
+    """Attachment that owns its own websocket/controller per app."""
+
+    @classmethod
+    async def create(cls, session, context=None):
+        return cls()
+
+
+class TestConnectionTargetMirroring:
+    """When ``connection_target`` is used, the central entry must mirror state."""
+
+    @pytest.mark.asyncio
+    async def test_websocket_mirrored_onto_entry(self):
+        BaseSessionRegistry.reset()
+        reg = BaseSessionRegistry[LlmingSession].get()
+        entry = LlmingSession(user_id="u1")
+        reg.register("s-mirror", entry)
+        attachment = _AppConnection()
+        entry.attach_data(attachment)
+
+        seen_entry_ws = []
+
+        async def on_connect(e, ws):
+            # During the connection, entry.websocket should mirror target.
+            seen_entry_ws.append(e.websocket is ws)
+            assert attachment.websocket is ws
+
+        ws = MockWebSocket([])  # disconnect immediately
+        await run_websocket_session(
+            ws, "s-mirror", reg,
+            on_connect=on_connect,
+            on_message=lambda e, m: None,
+            connection_target=lambda e: e.optional_data(_AppConnection),
+        )
+
+        assert seen_entry_ws == [True]
+        # On disconnect both target.websocket and entry.websocket are cleared.
+        assert entry.websocket is None
+        assert attachment.websocket is None
+
+    @pytest.mark.asyncio
+    async def test_zombie_reaper_sees_attached_connection(self):
+        """Stale-heartbeat reaping works for sessions that route WS via target."""
+        BaseSessionRegistry.reset()
+        reg = BaseSessionRegistry[LlmingSession].get()
+        entry = LlmingSession(user_id="u1")
+        reg.register("s-zombie", entry)
+        attachment = _AppConnection()
+        entry.attach_data(attachment)
+
+        connected = asyncio.Event()
+        release = asyncio.Event()
+
+        class StallingWS(MockWebSocket):
+            async def receive_text(self):
+                # Signal that we're inside the message loop, then block so
+                # the reaper can inspect the live state.
+                connected.set()
+                await release.wait()
+                from starlette.websockets import WebSocketDisconnect
+                raise WebSocketDisconnect(code=1000)
+
+        ws = StallingWS([])
+        session_task = asyncio.create_task(
+            run_websocket_session(
+                ws, "s-zombie", reg,
+                on_message=lambda e, m: None,
+                connection_target=lambda e: e.optional_data(_AppConnection),
+            )
+        )
+        try:
+            await asyncio.wait_for(connected.wait(), timeout=1.0)
+            # Simulate a stale heartbeat from the proxy-drop scenario.
+            entry.last_heartbeat = time.monotonic() - 1000
+
+            cleaned = reg.cleanup_expired(ttl=10_000.0, heartbeat_ttl=120.0)
+            assert cleaned == 1  # central entry sees an active WS and reaps it
+        finally:
+            release.set()
+            await asyncio.wait_for(session_task, timeout=1.0)
