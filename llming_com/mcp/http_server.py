@@ -5,7 +5,7 @@ Commands are resolved in-process -- direct session/controller access.
 
 Usage::
 
-    from llming_com.mcp_http_server import mount_mcp_server
+    from llming_com.mcp.http_server import mount_mcp_server
 
     mount_mcp_server(app, session_registry, prefix="/api/llming/mcp")
 """

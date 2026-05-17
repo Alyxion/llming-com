@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex">
+    <title>P2P App</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: Canvas;
+        color: CanvasText;
+      }
+      main {
+        width: min(34rem, calc(100vw - 2rem));
+      }
+      h1 {
+        margin: 0 0 1rem;
+        font-size: 1.5rem;
+        line-height: 1.2;
+      }
+      button {
+        min-height: 2.75rem;
+        padding: 0 1rem;
+        border: 1px solid ButtonBorder;
+        border-radius: 0.375rem;
+        background: ButtonFace;
+        color: ButtonText;
+        font: inherit;
+      }
+      button:disabled {
+        opacity: 0.55;
+      }
+      [data-p2p-status] {
+        margin: 1rem 0 0;
+        line-height: 1.45;
+      }
+      [data-tone="error"] {
+        color: #b42318;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 data-p2p-title>P2P App</h1>
+      <button type="button" data-p2p-connect disabled>Connect</button>
+      <p data-p2p-status>Loading pairing state...</p>
+    </main>
+    <script id="llming-p2p-config" type="application/json">{}</script>
+    <script src="./llming-p2p-viewer.js"></script>
+    <script>
+      window.LlmingP2PViewer.initApp().catch((error) => {
+        const node = document.querySelector("[data-p2p-status]");
+        if (node) {
+          node.textContent = error.message;
+          node.dataset.tone = "error";
+        }
+      });
+    </script>
+  </body>
+</html>

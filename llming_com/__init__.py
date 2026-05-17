@@ -56,6 +56,24 @@ from llming_com.session_manager import ConnectionType, SessionContext, SessionMa
 from llming_com.server import LlmingMiddleware, error_response, mount_client_static
 from llming_com.transport import run_websocket_session
 from llming_com.ws_router import AppRouter, SessionRouter, WSRouter
+from llming_com.access.remote import (
+    AccessHost,
+    AccessUser,
+    HostTunnel,
+    InMemoryAccessStore,
+    TunnelClient,
+    create_access_app,
+)
+from llming_com.p2p.admission import (
+    P2PAdmissionClient,
+    P2PAdmissionError,
+    RoomRegistration,
+)
+from llming_com.p2p.proxy import (
+    DataChannelProxy,
+    OneTimeTokenStore,
+    ReconnectTokenStore,
+)
 
 __all__ = [
     # Auth
@@ -101,4 +119,19 @@ __all__ = [
     # Middleware
     "LlmingMiddleware",
     "error_response",
+    # Remote access
+    "AccessHost",
+    "AccessUser",
+    "HostTunnel",
+    "InMemoryAccessStore",
+    "TunnelClient",
+    "create_access_app",
+    # P2P admission
+    "P2PAdmissionClient",
+    "P2PAdmissionError",
+    "RoomRegistration",
+    # P2P proxy
+    "DataChannelProxy",
+    "OneTimeTokenStore",
+    "ReconnectTokenStore",
 ]

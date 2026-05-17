@@ -1,0 +1,75 @@
+.mermaid,
+.mermaid svg,
+.md-content img[src$=".svg"],
+.md-content img[src*=".svg?"],
+.md-content img[src*=".excalidraw"] {
+  cursor: zoom-in;
+}
+
+.mermaid:focus-visible,
+.md-content img[data-llming-diagram-lightbox="1"]:focus-visible {
+  outline: 2px solid var(--md-accent-fg-color);
+  outline-offset: 0.25rem;
+}
+
+.llming-diagram-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: none;
+  background: color-mix(in srgb, var(--md-default-bg-color) 88%, transparent);
+  backdrop-filter: blur(3px);
+}
+
+.llming-diagram-lightbox[aria-hidden="false"] {
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.llming-diagram-lightbox__toolbar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+  background: var(--md-default-bg-color);
+}
+
+.llming-diagram-lightbox__button {
+  min-width: 2.25rem;
+  min-height: 2.25rem;
+  border: 1px solid var(--md-default-fg-color--lighter);
+  border-radius: 0.25rem;
+  color: var(--md-default-fg-color);
+  background: var(--md-code-bg-color);
+  font: inherit;
+  cursor: pointer;
+}
+
+.llming-diagram-lightbox__button:hover {
+  background: var(--md-accent-fg-color--transparent);
+}
+
+.llming-diagram-lightbox__canvas {
+  overflow: auto;
+  padding: 1.5rem;
+}
+
+.llming-diagram-lightbox__content {
+  width: max-content;
+  min-width: 100%;
+  transform-origin: top left;
+}
+
+.llming-diagram-lightbox__content svg,
+.llming-diagram-lightbox__content img {
+  display: block;
+  max-width: none !important;
+  width: auto !important;
+  height: auto !important;
+  min-width: min(96vw, 1400px);
+  padding: 1rem;
+  border-radius: 0.5rem;
+  background: var(--md-default-bg-color);
+}

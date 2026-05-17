@@ -1,0 +1,11 @@
+name = "llming-p2p-apps-test"
+main = "index.js"
+compatibility_date = "2026-03-01"
+
+[vars]
+LLMING_TEST_APPS = "1"
+LLMING_TEST_APPS_ENABLED_UNTIL = "1970-01-01T00:00:00Z"
+LLMING_TEST_RELAY_ENDPOINT = "https://test-relay.example.com"
+LLMING_TEST_ROOM = "llming-test-room"
+LLMING_TEST_PAIRING_TOKEN = "llming-test-pair"
+LLMING_TEST_DEVICE_CREDENTIAL = "llming-test-device"

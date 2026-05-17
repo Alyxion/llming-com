@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex">
+    <title>Pair Device</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: Canvas;
+        color: CanvasText;
+      }
+      main {
+        width: min(34rem, calc(100vw - 2rem));
+      }
+      [data-p2p-status] {
+        margin: 0;
+        line-height: 1.45;
+      }
+      [data-tone="error"] {
+        color: #b42318;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p data-p2p-status>Preparing pairing...</p>
+    </main>
+    <script id="llming-p2p-config" type="application/json">{}</script>
+    <script src="./llming-p2p-viewer.js"></script>
+    <script>
+      window.LlmingP2PViewer.redeemPairingToken().catch((error) => {
+        const node = document.querySelector("[data-p2p-status]");
+        if (node) {
+          node.textContent = error.message;
+          node.dataset.tone = "error";
+        }
+      });
+    </script>
+  </body>
+</html>

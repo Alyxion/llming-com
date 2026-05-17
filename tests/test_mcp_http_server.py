@@ -24,7 +24,7 @@ class _DummyRegistry(BaseSessionRegistry[BaseSessionEntry]):
 def _make_app(api_key: str = "test-key", localhost_only: bool = True) -> Starlette:
     """Build a minimal Starlette app with MCP mounted."""
     app = Starlette()
-    from llming_com.mcp_http_server import mount_mcp_server
+    from llming_com.mcp.http_server import mount_mcp_server
     mount_mcp_server(
         app,
         _DummyRegistry(),
@@ -39,7 +39,7 @@ def _make_app(api_key: str = "test-key", localhost_only: bool = True) -> Starlet
 
 def test_mount_requires_api_key():
     """mount_mcp_server must raise if api_key is empty or missing."""
-    from llming_com.mcp_http_server import mount_mcp_server
+    from llming_com.mcp.http_server import mount_mcp_server
     app = Starlette()
     with pytest.raises(ValueError, match="api_key is required"):
         mount_mcp_server(app, _DummyRegistry(), api_key="")
@@ -47,7 +47,7 @@ def test_mount_requires_api_key():
 
 def test_mount_requires_api_key_none():
     """Passing None for api_key must fail at the type level or raise."""
-    from llming_com.mcp_http_server import mount_mcp_server
+    from llming_com.mcp.http_server import mount_mcp_server
     app = Starlette()
     with pytest.raises((ValueError, TypeError)):
         mount_mcp_server(app, _DummyRegistry(), api_key=None)

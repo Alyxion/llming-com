@@ -1,0 +1,21 @@
+name = "llming-relay"
+main = "index.js"
+compatibility_date = "2026-03-01"
+
+# Copy this directory outside site-packages, configure your route, and deploy:
+#   npx wrangler deploy --config wrangler.toml --route 'relay.example.com/*'
+
+[durable_objects]
+bindings = [
+  { name = "RELAY", class_name = "SignalRelay" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SignalRelay"]
+
+[vars]
+# Generate a key, then store only its SHA-256 hash here:
+#   openssl rand -base64 32
+#   printf '%s' "$LLMING_RELAY_ADMISSION_KEY" | shasum -a 256
+HOST_ADMISSION_KEY_HASHES = "sha256:<hex-sha256>"

@@ -8,7 +8,7 @@ Config for ``.mcp.json``::
         "mcpServers": {
             "llming-debug": {
                 "command": "python",
-                "args": ["-m", "llming_com.mcp_stdio_server"],
+                "args": ["-m", "llming_com.mcp.stdio_server"],
                 "env": {
                     "LLMING_DEBUG_URL": "http://localhost:8080/api/llming/debug",
                     "LLMING_DEBUG_KEY": "your-api-key"

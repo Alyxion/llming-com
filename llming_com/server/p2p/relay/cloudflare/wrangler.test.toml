@@ -1,0 +1,20 @@
+name = "llming-relay-test"
+main = "index.js"
+compatibility_date = "2026-03-01"
+
+# Disabled-by-default public integration-test relay. Enable only for a bounded
+# test window by setting LLMING_TEST_RELAY_ENABLED_UNTIL to a future ISO time.
+
+[durable_objects]
+bindings = [
+  { name = "RELAY", class_name = "SignalRelay" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SignalRelay"]
+
+[vars]
+LLMING_TEST_RELAY = "1"
+LLMING_TEST_RELAY_ENABLED_UNTIL = "1970-01-01T00:00:00Z"
+HOST_ADMISSION_KEY_HASHES = "sha256:<hex-sha256>"

@@ -34,6 +34,47 @@ Two surfaces, two router types -- pick by audience, not by preference:
 
 Do not add HTTP routes for UI commands -- those belong on `SessionRouter` or `AppRouter`. Do not push large blobs through the WS message pipe -- those belong on plain HTTP endpoints. The `@command` framework is for the debug/admin surface; it is not a UI command system.
 
+## Shared P2P And Proxy Transport
+
+`llming-com` is the canonical home for shared transport primitives used by
+OpenHort and other llming applications.  Generic P2P, relay, proxy, pairing,
+reconnect, DataChannel proxy, and browser viewer behavior should be implemented
+here first and reused by product repositories.
+
+This includes:
+
+- the public relay HTTP/WebSocket contract;
+- server-side P2P relay assets with Cloudflare as one deployment backend;
+- opaque pairing-token redemption;
+- paired-device credential helpers;
+- reconnect grants for reload, phone sleep, and network interruption;
+- DataChannel proxy message framing;
+- generic browser viewer assets that can read stored credentials and initiate a
+  fresh handshake.
+
+Product repositories should configure and wrap these primitives, not fork them.
+OpenHort uses this layer to access isolated agentic services; OpenHort
+commercial/private code may add accounts, billing, tenant policy, and quotas
+behind the same endpoint/key contract.
+
+Pairing URLs should be bootstrap-only and opaque:
+
+```text
+https://example.com/p2p/pair#pt=<opaque-pairing-token>
+```
+
+After redemption, the viewer should store the paired-device credential in browser
+storage and redirect to a stable bookmarkable URL such as:
+
+```text
+https://example.com/p2p/app
+```
+
+That stable page is responsible for reading IndexedDB/local storage/cookies,
+requesting fresh handshakes, and reconnecting after reload or phone sleep.
+Secrets and display metadata such as app name or icon should not be embedded in
+bookmarkable URLs.
+
 ## Features
 
 - HMAC-SHA256 cookie authentication (session + identity tokens with expiry)
@@ -63,11 +104,27 @@ Run any sample with `LLMING_AUTH_SECRET=demo PYTHONPATH=. python samples/<name>.
 
 ```
 llming_com/           Core library (auth, session, transport, commands, debug, data store)
-llming_com/static/    JavaScript client (LlmingWebSocket)
+llming_com/access/    Remote access tunnel primitives
+llming_com/mcp/       MCP HTTP/SSE and stdio transports
+llming_com/p2p/       P2P admission and DataChannel proxy helpers
+llming_com/static/    JavaScript client and generic P2P viewer assets
+llming_com/server/p2p/ Server-side P2P relay assets and deployment backends
 tests/                Pytest suite
 samples/              Example applications (run with: LLMING_AUTH_SECRET=demo python samples/demo_app.py)
 docs/                 Documentation and assets
 ```
+
+## Documentation
+
+The documentation site uses Material for MkDocs:
+
+```bash
+poetry run mkdocs serve -f mkdocs.yml
+poetry run mkdocs build -f mkdocs.yml
+```
+
+The P2P workflow page demonstrates the Mermaid diagram lightbox used for
+zoomable protocol and flow diagrams.
 
 ## Development
 
