@@ -43,6 +43,8 @@ here first and reused by product repositories.
 
 This includes:
 
+- named publishing: stable `apps.example.com/{account}/{app}` URLs with a link
+  lifetime and durable reconnect (`PublishRegistry`, `mount_publish`, `serve_published`);
 - the public relay HTTP/WebSocket contract;
 - server-side P2P relay assets with Cloudflare as one deployment backend;
 - opaque pairing-token redemption;
@@ -97,8 +99,20 @@ Runnable examples live in [`samples/`](samples/):
 - `auth_demo.py` — HMAC tokens, identity tokens, tamper detection
 - `websocket_server.py` — FastAPI WebSocket app with debug router
 - `demo_app.py` — full interactive demo with the `@command` framework and the JavaScript client
+- `p2p_demo.py` — **end-to-end P2P**: a browser loads an app over a direct WebRTC
+  DataChannel (HTTP signaling, no relay). Pass `--proxy-fallback <hub-url>` to
+  enable the `p2p+proxy` mode that falls back to the proxy hub when P2P fails.
+- `proxy_host_demo.py` — **end-to-end proxy**: the access hub
+  (`create_access_app`) + an outbound `TunnelClient` expose a local app at
+  `/proxy/{host}/`. This is the P2P fallback transport.
+- `publish_demo.py` — **named publishing**: a stable, bookmarkable URL
+  (`/{account}/{app}`) with a link lifetime, one-time QR/`?k=` pairing, and
+  **durable reconnect** — reload after powersave / 10 minutes / the next day and
+  it re-handshakes from a stored device credential, no re-scan. See
+  [Connectivity](docs/manual/p2p/connectivity.md).
 
 Run any sample with `LLMING_AUTH_SECRET=demo PYTHONPATH=. python samples/<name>.py`.
+The P2P sample needs the optional WebRTC extra: `pip install "llming-com[webrtc]"`.
 
 ## Project Structure
 
@@ -106,7 +120,7 @@ Run any sample with `LLMING_AUTH_SECRET=demo PYTHONPATH=. python samples/<name>.
 llming_com/           Core library (auth, session, transport, commands, debug, data store)
 llming_com/access/    Remote access tunnel primitives
 llming_com/mcp/       MCP HTTP/SSE and stdio transports
-llming_com/p2p/       P2P admission and DataChannel proxy helpers
+llming_com/p2p/       P2P admission, DataChannel proxy, WebRTC peer, FastAPI signaling host
 llming_com/static/    JavaScript client and generic P2P viewer assets
 llming_com/server/p2p/ Server-side P2P relay assets and deployment backends
 tests/                Pytest suite

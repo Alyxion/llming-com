@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared Knowledge Board</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; background:#0d1117; color:#e6edf3;
+         margin:0; padding:24px; -webkit-tap-highlight-color: transparent; }
+  .wrap { max-width:560px; margin:0 auto; }
+  h1 { margin:0 0 4px; font-size:20px; }
+  .sub { color:#7d8590; font-size:13px; margin-bottom:18px; }
+  .who { color:#79c0ff; font-weight:700; }
+  #transport { color:#4ade80; font-weight:700; }
+  .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  .tile { aspect-ratio:1/1; border-radius:16px; border:1px solid #30363d;
+          background:#161b22; cursor:pointer; display:flex; align-items:center;
+          justify-content:center; font-size:34px; font-weight:800; color:#30363d;
+          user-select:none; transition:transform .06s ease, background .15s ease, color .15s ease; }
+  .tile:active { transform:scale(.94); }
+  .tile.on { background:#1f6feb; color:#fff; border-color:#1f6feb; box-shadow:0 0 0 3px #1f6feb44; }
+  .bar { margin-top:18px; padding:10px 14px; background:#161b22; border:1px solid #21262d;
+         border-radius:10px; font-size:13px; display:flex; justify-content:space-between; }
+  .signout { cursor:pointer; color:#f87171; border:1px solid #f8717155; border-radius:8px;
+             padding:2px 8px; font-size:12px; }
+  .signout:hover { background:#f8717111; }
+  .pairbtn { cursor:pointer; color:#79c0ff; border:1px solid #1f6feb55; border-radius:8px;
+             padding:2px 8px; font-size:12px; }
+  .pairbtn:hover { background:#1f6feb22; }
+  .pulse { animation:flash .5s ease; }
+  @keyframes flash { 0%{box-shadow:0 0 0 6px #4ade8088;} 100%{box-shadow:none;} }
+</style>
+</head>
+<body data-role="__ROLE__" data-grid="__GRID__" data-qr="__QR__" data-code="__CODE__">
+<div class="wrap">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <h1>🧠 Shared Knowledge Board</h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="pairbtn" class="pairbtn" style="display:none">▦ pair a device</span>
+      <span id="signout" class="signout" style="display:none">sign out</span>
+    </div>
+  </div>
+  <div class="sub">role: <b id="role">__ROLE__</b> · transport: <span id="transport">…</span> ·
+       <span id="peers">0</span> connected</div>
+  <div class="grid" id="grid"></div>
+  <div class="bar">
+    <span>last change by <span class="who" id="lastby">—</span></span>
+    <span id="status">connecting…</span>
+  </div>
+</div>
+<!-- Scripts are INLINED by the server at serve time (markers below). Over the
+     P2P/relay tunnel only fetch/WebSocket are shimmed, not <script src>, so the
+     page must be self-contained. -->
+<script>/*__LLMING_WS__*/</script>
+<!--__PAIRING__-->
+<script>/*__BOARD__*/</script>
+</body>
+</html>

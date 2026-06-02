@@ -130,6 +130,26 @@ class P2PAdmissionClient:
             authorized=True,
         )
 
+    async def sdp_inbox(self, room: str) -> list[dict[str, Any]]:
+        """Poll for SDP messages a viewer WebSocket left for the host."""
+
+        body = await self._request(
+            self.room_http_url(room, "sdp-inbox"),
+            authorized=True,
+        )
+        messages = body.get("messages", [])
+        return messages if isinstance(messages, list) else []
+
+    async def sdp_send(self, room: str, message: dict[str, Any]) -> dict[str, Any]:
+        """Forward an SDP message (e.g. the answer) to the viewer's WebSocket."""
+
+        return await self._request(
+            self.room_http_url(room, "sdp-send"),
+            method="POST",
+            body=message,
+            authorized=True,
+        )
+
     async def _request(
         self,
         url: str,

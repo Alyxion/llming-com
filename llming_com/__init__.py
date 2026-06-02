@@ -74,6 +74,17 @@ from llming_com.p2p.proxy import (
     OneTimeTokenStore,
     ReconnectTokenStore,
 )
+from llming_com.p2p.host import (
+    create_p2p_host_app,
+    mount_p2p_host,
+    mount_publish,
+    serve_published,
+)
+from llming_com.p2p.webrtc import WebRTCPeer, WebRTCPeerRegistry
+from llming_com.p2p.relay_host import RelayHost
+from llming_com.p2p.secure_relay import SecureRelayHost, run_secure_relay_host
+from llming_com.publish import DeviceGrant, PublishedApp, PublishRegistry
+from llming_com.secure import EphemeralKey, HostIdentity, SecureChannel, SecureFramer, fingerprint
 
 __all__ = [
     # Auth
@@ -134,4 +145,24 @@ __all__ = [
     "DataChannelProxy",
     "OneTimeTokenStore",
     "ReconnectTokenStore",
+    # P2P host (FastAPI signaling + WebRTC)
+    "create_p2p_host_app",
+    "mount_p2p_host",
+    "WebRTCPeer",
+    "WebRTCPeerRegistry",
+    "RelayHost",
+    "SecureRelayHost",
+    "run_secure_relay_host",
+    # Named publishing (stable URLs, lifetime, durable reconnect)
+    "PublishRegistry",
+    "PublishedApp",
+    "DeviceGrant",
+    "mount_publish",
+    "serve_published",
+    # End-to-end encryption (blind relay)
+    "HostIdentity",
+    "EphemeralKey",
+    "SecureChannel",
+    "SecureFramer",
+    "fingerprint",
 ]

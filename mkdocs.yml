@@ -65,4 +65,5 @@ markdown_extensions:
 nav:
   - Home: index.md
   - P2P:
+    - Connectivity: p2p/connectivity.md
     - Workflow: p2p/workflow.md

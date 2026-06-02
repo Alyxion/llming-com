@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llming P2P viewer</title>
+<!--LLMING_P2P_CONFIG-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; background: #11151c; color: #e6edf3; }
+  #llming-p2p-status {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; z-index: 999999;
+    background: #11151c; transition: opacity .3s;
+  }
+  #llming-p2p-status .ring {
+    width: 46px; height: 46px; border-radius: 50%;
+    border: 4px solid #243; border-top-color: #4ade80; animation: spin 1s linear infinite;
+  }
+  #llming-p2p-status .label { font-size: 15px; letter-spacing: .3px; }
+  #llming-p2p-status .sub { font-size: 12px; color: #7d8590; max-width: 80vw; text-align: center; }
+  #llming-p2p-status.error .ring { border-top-color: #f87171; animation: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="llming-p2p-status">
+  <div class="ring"></div>
+  <div class="label">Connecting…</div>
+  <div class="sub" id="llming-p2p-sub">starting peer-to-peer transport</div>
+</div>
+<script>
+"use strict";
+/*
+ * Generic, application-neutral P2P viewer for llming-com.
+ *
+ * It is a *transparent tunnel*: it contains no app UI. It establishes a WebRTC
+ * DataChannel to the host, overrides window.fetch and window.WebSocket so every
+ * request flows over that channel (the DataChannelProxy protocol in
+ * llming_com/p2p/proxy.py), then loads the real app from the host and replaces
+ * this page with it.
+ *
+ * Signaling: HTTP (POST {offer_url}) by default; relay WebSocket when ?signal=ws.
+ * Fallback:  if mode is "p2p+proxy" and P2P does not connect in time, the page
+ *            navigates to the proxy hub URL instead.
+ */
+const WS_ID_LEN = 4;
+const qs = new URLSearchParams(location.search);
+// Host public-key fingerprint pinned out-of-band via the pairing QR's URL
+// fragment (#hk=…). The fragment is never sent to the relay, so it can't forge
+// it. Captured before any history.replaceState strips the fragment.
+const PINNED_HK = new URLSearchParams(location.hash.replace(/^#/, '')).get('hk') || '';
+
+function setStatus(label, sub, isError) {
+  const box = document.getElementById('llming-p2p-status');
+  if (!box) return;
+  if (label) box.querySelector('.label').textContent = label;
+  const subEl = document.getElementById('llming-p2p-sub');
+  if (sub !== undefined && subEl) subEl.textContent = sub;
+  box.classList.toggle('error', !!isError);
+}
+function hideStatus() {
+  const box = document.getElementById('llming-p2p-status');
+  if (box) { box.style.opacity = '0'; setTimeout(() => box.remove(), 350); }
+}
+
+// ---- configuration ----
+// Either an inlined <script id="llming-p2p-config"> block (named publish URLs,
+// stays on the stable URL) or a same-origin {prefix}/config fetch (raw viewer).
+async function loadConfig() {
+  const prefix = qs.get('prefix') || '/p2p';
+  let cfg = {};
+  const inline = document.getElementById('llming-p2p-config');
+  if (inline && (inline.textContent || '').trim()) {
+    try { cfg = JSON.parse(inline.textContent); } catch (e) { /* ignore */ }
+  } else {
+    try {
+      const res = await fetch(prefix + '/config', { cache: 'no-store' });
+      if (res.ok) cfg = await res.json();
+    } catch (e) { /* fall through to query-param defaults */ }
+  }
+  return {
+    signal: qs.get('signal') || cfg.signal || 'http',
+    mode: qs.get('mode') || cfg.mode || 'p2p',
+    offerUrl: qs.get('offer_url') || cfg.offer_url || (prefix + '/offer'),
+    proxyFallbackUrl: qs.get('proxy') || cfg.proxy_fallback_url || '',
+    connectTimeoutMs: parseInt(qs.get('timeout') || cfg.p2p_connect_timeout_ms || 8000, 10),
+    relay: qs.get('relay') || cfg.relay || '',
+    room: qs.get('room') || cfg.room || '',
+    stun: Array.isArray(cfg.stun_servers) ? cfg.stun_servers : ['stun:stun.l.google.com:19302'],
+    // Full ICE servers (STUN + TURN with credentials). When present these win
+    // over `stun`, enabling a TURN-relayed path on networks that block direct P2P.
+    iceServers: Array.isArray(cfg.ice_servers) ? cfg.ice_servers : null,
+    // E2E-encrypted blind-relay fallback (set by the handshake descriptor).
+    secureRelayUrl: cfg.secure_relay_url || '',
+    hostPubkey: cfg.host_pubkey || '',
+    // publish (named-app) front door — null for the raw viewer
+    publish: cfg.publish || null,
+    redeemUrl: cfg.redeem_url || '',
+    handshakeUrl: cfg.handshake_url || '',
+  };
+}
+
+// ---- durable device credential (survives reload / powersave / next day) ----
+const CRED_DB = 'llming-publish';
+function _credKey(slug) { return 'llming-cred:' + slug; }
+function openCredDb() {
+  if (!('indexedDB' in window)) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const req = indexedDB.open(CRED_DB, 1);
+    req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains('creds')) req.result.createObjectStore('creds'); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  });
+}
+async function getCred(slug) {
+  const db = await openCredDb();
+  if (!db) { return localStorage.getItem(_credKey(slug)); }
+  return new Promise((resolve) => {
+    const r = db.transaction('creds', 'readonly').objectStore('creds').get(slug);
+    r.onsuccess = () => resolve(r.result || localStorage.getItem(_credKey(slug)));
+    r.onerror = () => resolve(localStorage.getItem(_credKey(slug)));
+  });
+}
+async function putCred(slug, cred) {
+  localStorage.setItem(_credKey(slug), cred); // fallback mirror
+  const db = await openCredDb();
+  if (!db) return;
+  await new Promise((resolve) => {
+    const r = db.transaction('creds', 'readwrite').objectStore('creds').put(cred, slug);
+    r.onsuccess = () => resolve(); r.onerror = () => resolve();
+  });
+}
+async function delCred(slug) {
+  localStorage.removeItem(_credKey(slug));
+  const db = await openCredDb();
+  if (!db) return;
+  await new Promise((resolve) => {
+    const r = db.transaction('creds', 'readwrite').objectStore('creds').delete(slug);
+    r.onsuccess = () => resolve(); r.onerror = () => resolve();
+  });
+}
+
+// Pairing/share token: ?k=... (query) or #pt=... (fragment, kept out of history).
+function pairingTokenFromUrl() {
+  const fromQuery = qs.get('k');
+  if (fromQuery) return fromQuery;
+  const frag = new URLSearchParams(location.hash.replace(/^#/, ''));
+  return frag.get('pt') || frag.get('pairing_token') || '';
+}
+
+// Front door for a named published app: ensure a device credential, then
+// handshake for a fresh connection. Returns false if the device must pair first.
+async function runPublishHandshake(cfg) {
+  const slug = cfg.publish.account + '/' + cfg.publish.app;
+  let cred = await getCred(slug);
+  const token = pairingTokenFromUrl();
+  if (!cred && token && cfg.redeemUrl) {
+    setStatus('Pairing device…', 'redeeming your invite');
+    try {
+      const res = await fetch(cfg.redeemUrl, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pairing_token: token }), credentials: 'include',
+      });
+      if (res.ok) {
+        cred = (await res.json()).device_credential;
+        if (cred) await putCred(slug, cred);
+        // strip the secret from the address bar (keep the stable URL bookmarkable)
+        history.replaceState(null, '', location.pathname);
+      }
+    } catch (e) { /* fall through */ }
+  }
+  if (!cred) {
+    setStatus('Pair this device', 'open the invite link or scan the QR code to connect', true);
+    return false;
+  }
+  setStatus('Reconnecting…', 'verifying this device and opening a fresh connection');
+  let conn;
+  try {
+    const res = await fetch(cfg.handshakeUrl, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ device_credential: cred }), credentials: 'include',
+    });
+    if (res.status === 401 || res.status === 403) {
+      await delCred(slug);
+      setStatus('Link expired', 'this published link is no longer active — ask for a new invite', true);
+      return false;
+    }
+    conn = await res.json();
+  } catch (e) {
+    setStatus('Connection failed', String(e), true);
+    return false;
+  }
+  // merge the fresh connection descriptor into cfg
+  if (conn.mode) cfg.mode = conn.mode;
+  if (conn.signal) cfg.signal = conn.signal;
+  if (conn.offer_url) cfg.offerUrl = conn.offer_url;
+  if (conn.relay) cfg.relay = conn.relay;
+  if (conn.room) cfg.room = conn.room;
+  if (conn.proxy_fallback_url) cfg.proxyFallbackUrl = conn.proxy_fallback_url;
+  if (Array.isArray(conn.stun_servers)) cfg.stun = conn.stun_servers;
+  if (Array.isArray(conn.ice_servers)) cfg.iceServers = conn.ice_servers;
+  if (conn.secure_relay_url) cfg.secureRelayUrl = conn.secure_relay_url;
+  if (conn.host_pubkey) cfg.hostPubkey = conn.host_pubkey;
+  return true;
+}
+
+// ---- DataChannel proxy client ----
+let dc = null;
+const pendingHttp = new Map();   // id -> resolve
+const wsClients = new Map();     // id -> fake WebSocket
+let reqCounter = 0;
+let wsCounter = 0;
+
+function nextHttpId() { return 'r' + (++reqCounter); }
+function nextWsId() { return 'w' + ((++wsCounter) % 1000); } // <= 4 chars for binary framing
+
+function dcSend(obj) { dc.send(typeof obj === 'string' ? obj : JSON.stringify(obj)); }
+
+function onDcMessage(ev) {
+  const data = ev.data;
+  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+    const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer);
+    const id = new TextDecoder().decode(buf.slice(0, WS_ID_LEN)).replace(/\0+$/, '');
+    const sock = wsClients.get(id);
+    if (sock && sock._emitMessage) sock._emitMessage(buf.slice(WS_ID_LEN));
+    return;
+  }
+  let msg;
+  try { msg = JSON.parse(data); } catch (e) { return; }
+  const type = msg.type;
+  if (type === 'http_response') {
+    const resolve = pendingHttp.get(msg.id);
+    if (resolve) { pendingHttp.delete(msg.id); resolve(msg); }
+  } else if (type === 'pong') {
+    /* keepalive; reconnect_token available in msg.reconnect_token */
+  } else if (type === 'ws_ready') {
+    const sock = wsClients.get(msg.id);
+    if (sock && sock._open) sock._open();
+  } else if (type === 'ws_text') {
+    const sock = wsClients.get(msg.id);
+    if (sock && sock._emitMessage) sock._emitMessage(msg.data);
+  } else if (type === 'ws_close') {
+    const sock = wsClients.get(msg.id);
+    if (sock && sock._emitClose) sock._emitClose();
+  }
+}
+
+// proxied fetch over the DataChannel
+function proxyFetch(input, init) {
+  init = init || {};
+  let url = typeof input === 'string' ? input : input.url;
+  const method = (init.method || (typeof input === 'object' && input.method) || 'GET').toUpperCase();
+  let path;
+  try { const u = new URL(url, location.origin); path = u.pathname + u.search; }
+  catch (e) { path = url; }
+  const headers = {};
+  if (init.headers) new Headers(init.headers).forEach((v, k) => { headers[k] = v; });
+  const id = nextHttpId();
+  return new Promise((resolve) => {
+    pendingHttp.set(id, (msg) => {
+      let body = msg.body || '';
+      if (msg.binary) {
+        const bin = atob(body);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        body = bytes;
+      }
+      resolve(new Response(body, { status: msg.status || 200, headers: msg.headers || {} }));
+    });
+    dcSend({ id, type: 'http', method, path, headers, body: init.body ? String(init.body) : '' });
+  });
+}
+
+// proxied WebSocket over the DataChannel
+function makeProxyWebSocket() {
+  const RealWS = window.WebSocket;
+  function ProxyWebSocket(url) {
+    const id = nextWsId();
+    let path;
+    try { const u = new URL(url, location.origin); path = u.pathname + u.search; } catch (e) { path = url; }
+    this.url = url; this.readyState = 0; // CONNECTING
+    this.onopen = this.onmessage = this.onclose = this.onerror = null;
+    const self = this;
+    this._id = id;
+    this._open = function () { self.readyState = 1; if (self.onopen) self.onopen({ type: 'open' }); };
+    this._emitMessage = function (payload) { if (self.onmessage) self.onmessage({ data: payload }); };
+    this._emitClose = function () { self.readyState = 3; wsClients.delete(id); if (self.onclose) self.onclose({ type: 'close' }); };
+    wsClients.set(id, this);
+    dcSend({ id, type: 'ws_open', path });
+  }
+  ProxyWebSocket.prototype.send = function (data) {
+    if (typeof data === 'string') { dcSend({ id: this._id, type: 'ws_text', data }); return; }
+    const payload = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data);
+    const idBytes = new TextEncoder().encode(this._id.slice(0, WS_ID_LEN));
+    const frame = new Uint8Array(WS_ID_LEN + payload.length);
+    frame.set(idBytes.slice(0, WS_ID_LEN), 0);
+    frame.set(payload, WS_ID_LEN);
+    dc.send(frame.buffer);
+  };
+  ProxyWebSocket.prototype.close = function () { dcSend({ id: this._id, type: 'ws_close' }); this._emitClose(); };
+  ProxyWebSocket.CONNECTING = 0; ProxyWebSocket.OPEN = 1; ProxyWebSocket.CLOSING = 2; ProxyWebSocket.CLOSED = 3;
+  ProxyWebSocket._real = RealWS;
+  return ProxyWebSocket;
+}
+
+// ---- signaling ----
+async function signalHttp(cfg, offerSdp) {
+  const res = await fetch(cfg.offerUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sdp: offerSdp, type: 'offer' }),
+  });
+  if (!res.ok) throw new Error('signaling failed: ' + res.status);
+  return (await res.json()).sdp;
+}
+
+function relayBase(cfg) {
+  // Explicit relay (http/https/ws/wss) or default to this origin's /relay path.
+  let base = cfg.relay || (location.origin + '/relay');
+  base = base.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+  if (!/^wss?:/.test(base)) base = (location.protocol === 'https:' ? 'wss://' : 'ws://') + base.replace(/^\/+/, '');
+  return base.replace(/\/$/, '');
+}
+
+function signalWs(cfg, offerSdp) {
+  return new Promise((resolve, reject) => {
+    const base = relayBase(cfg);
+    const ws = new (makeProxyWebSocket()._real)(base + '/' + encodeURIComponent(cfg.room));
+    const timer = setTimeout(() => { try { ws.close(); } catch (e) {} reject(new Error('relay timeout')); }, 15000);
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'offer', sdp: offerSdp }));
+    ws.onmessage = (ev) => {
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === 'answer') { clearTimeout(timer); ws.close(); resolve(msg.sdp); }
+    };
+    ws.onerror = () => { clearTimeout(timer); reject(new Error('relay error')); };
+  });
+}
+
+// Inspect the negotiated ICE candidate pair to tell a *direct* peer-to-peer
+// link (host/srflx/prflx candidates) apart from one *relayed through TURN*
+// (relay candidate). Returns 'direct' | 'turn' | 'unknown'.
+async function detectIcePath(pc) {
+  try {
+    const stats = await pc.getStats();
+    let pairId = null;
+    stats.forEach((r) => { if (r.type === 'transport' && r.selectedCandidatePairId) pairId = r.selectedCandidatePairId; });
+    let pair = null;
+    stats.forEach((r) => {
+      if (r.type !== 'candidate-pair') return;
+      if ((pairId && r.id === pairId) || (!pairId && r.nominated && r.state === 'succeeded')) pair = r;
+    });
+    if (!pair) return 'unknown';
+    let local = null, remote = null;
+    stats.forEach((r) => {
+      if (r.id === pair.localCandidateId) local = r;
+      if (r.id === pair.remoteCandidateId) remote = r;
+    });
+    const types = [local && local.candidateType, remote && remote.candidateType];
+    if (types.includes('relay')) return 'turn';
+    return 'direct';
+  } catch (e) { return 'unknown'; }
+}
+
+// Publish the live connection path so the loaded app can display it.
+// transport: 'p2p' | 'proxy'; path: 'direct' | 'turn' | 'unknown'.
+function publishConn(transport, path) {
+  try { window.__llmingConn = { transport: transport, path: path || 'unknown' }; } catch (e) {}
+}
+
+async function waitIceComplete(pc) {
+  if (pc.iceGatheringState === 'complete') return;
+  await new Promise((resolve) => {
+    const check = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', check); resolve(); } };
+    pc.addEventListener('icegatheringstatechange', check);
+    setTimeout(resolve, 3000);
+  });
+}
+
+// ---- app boot: replace this page with the host app, loaded over the tunnel ----
+async function bootApp() {
+  setStatus('Loading app…', 'fetching app shell over the data channel');
+  const res = await proxyFetch('/', { method: 'GET' });
+  const html = await res.text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  // Move head styles/links, then body, re-executing scripts.
+  document.title = doc.title || document.title;
+  hideStatus();
+  const newBody = doc.body ? doc.body.innerHTML : html;
+  document.body.innerHTML = newBody;
+  // copy non-script head elements (styles)
+  doc.head.querySelectorAll('style, link[rel="stylesheet"]').forEach((el) => document.head.appendChild(el.cloneNode(true)));
+  // re-execute scripts in order
+  const scripts = Array.from(doc.querySelectorAll('script'));
+  for (const old of scripts) {
+    const s = document.createElement('script');
+    if (old.src) { s.src = old.src; } else { s.textContent = old.textContent; }
+    document.body.appendChild(s);
+  }
+}
+
+// ---- E2E crypto (Web Crypto; byte-compatible with llming_com/secure.py) ----
+// ECDH P-256 -> HKDF-SHA256(salt=32 zeros, info) -> AES-256-GCM.
+const E2E_INFO = new TextEncoder().encode('llming-com/e2e/v1 aes-256-gcm');
+
+function b64uToBytes(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/'); s += '='.repeat((4 - s.length % 4) % 4);
+  const bin = atob(s); const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesToB64u(bytes) {
+  let bin = ''; const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function concatBytes(a, b) { const out = new Uint8Array(a.length + b.length); out.set(a, 0); out.set(b, a.length); return out; }
+
+async function e2eFingerprint(pubRawB64) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', b64uToBytes(pubRawB64)));
+  return bytesToB64u(digest).slice(0, 16);
+}
+async function e2eDeriveKey(hostPubRawB64) {
+  const hostKey = await crypto.subtle.importKey('raw', b64uToBytes(hostPubRawB64), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  const ephPubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey));
+  const secret = await crypto.subtle.deriveBits({ name: 'ECDH', public: hostKey }, eph.privateKey, 256);
+  const hkdfKey = await crypto.subtle.importKey('raw', secret, 'HKDF', false, ['deriveKey']);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: E2E_INFO },
+    hkdfKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  return { aesKey, ephPubB64: bytesToB64u(ephPubRaw) };
+}
+async function e2eSeal(aesKey, bytes) {
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aesKey, bytes));
+  return concatBytes(nonce, ct);
+}
+async function e2eOpen(aesKey, blob) {
+  const u8 = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.slice(0, 12) }, aesKey, u8.slice(12));
+  return new Uint8Array(pt);
+}
+
+// Durable pin: remember the host key fingerprint per app (trust-on-first-use,
+// or pinned from the #hk fragment) so reconnects detect a swapped key.
+function hkKey(slug) { return 'llming-hk:' + slug; }
+
+// Resident encrypted relay: run the SAME proxy shims (fetch/WebSocket) over an
+// AES-GCM WebSocket the hub forwards blindly. Frames: browser↔relay = kind||body
+// ('H' hello, 'A' sealed app frame, 'C' close).
+async function connectSecureRelay(cfg, slug) {
+  if (!cfg.secureRelayUrl || !cfg.hostPubkey) return false;
+  const fp = await e2eFingerprint(cfg.hostPubkey);
+  const pinned = PINNED_HK || (slug ? localStorage.getItem(hkKey(slug)) : '');
+  if (pinned && pinned !== fp) {
+    setStatus('Security check failed', 'the host key does not match the pinned fingerprint — refusing to connect', true);
+    return true; // handled (do NOT fall through to a plaintext path)
+  }
+  if (slug && !pinned) localStorage.setItem(hkKey(slug), fp); // trust on first use
+
+  setStatus('Connecting securely…', 'establishing an end-to-end encrypted relay');
+  const { aesKey, ephPubB64 } = await e2eDeriveKey(cfg.hostPubkey);
+  const u = new URL(cfg.secureRelayUrl, location.href);
+  u.protocol = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+  const ws = new (makeProxyWebSocket()._real)(u.href);
+  ws.binaryType = 'arraybuffer';
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    const fail = (why) => { if (!settled) { settled = true; try { ws.close(); } catch (e) {} resolve(false); } if (why) { /* caller decides */ } };
+
+    let sendChain = Promise.resolve();     // serialize seals to preserve frame order
+    let recvChain = Promise.resolve();
+
+    ws.onopen = () => {
+      // hello: 'H' || {epub}
+      const hello = concatBytes(new Uint8Array([0x48]), new TextEncoder().encode(JSON.stringify({ epub: ephPubB64 })));
+      ws.send(hello.buffer);
+      // route the proxy client over this encrypted channel
+      dc = {
+        send: (data) => {
+          sendChain = sendChain.then(async () => {
+            const tagged = (typeof data === 'string')
+              ? concatBytes(new Uint8Array([0x4A]), new TextEncoder().encode(data))   // 'J'
+              : concatBytes(new Uint8Array([0x42]), new Uint8Array(data.buffer || data)); // 'B'
+            const sealed = await e2eSeal(aesKey, tagged);
+            ws.send(concatBytes(new Uint8Array([0x41]), sealed).buffer);                  // 'A'
+          });
+        },
+      };
+      settled = true;
+      connectedSecure(cfg, aesKey, ws);
+      resolve(true);
+    };
+    ws.onmessage = (ev) => {
+      recvChain = recvChain.then(async () => {
+        const u8 = new Uint8Array(ev.data);
+        const kind = u8[0];
+        if (kind === 0x43) { setStatus('Disconnected', 'the secure session was closed', true); return; }
+        if (kind !== 0x41) return;
+        let plain;
+        try { plain = await e2eOpen(aesKey, u8.slice(1)); } catch (e) { return; }
+        const tag = plain[0]; const body = plain.slice(1);
+        if (tag === 0x4A) onDcMessage({ data: new TextDecoder().decode(body) });
+        else if (tag === 0x42) onDcMessage({ data: body });
+      });
+    };
+    ws.onerror = () => fail('relay error');
+    ws.onclose = () => fail('relay closed');
+  });
+}
+
+let _secureBooted = false;
+async function connectedSecure(cfg, aesKey, ws) {
+  if (_secureBooted) return;
+  _secureBooted = true;
+  publishConn('proxy', 'e2e');  // encrypted blind relay through the hub
+  setStatus('Connected', 'end-to-end encrypted relay established');
+  window.fetch = (input, init) => proxyFetch(input, init);
+  window.WebSocket = makeProxyWebSocket();
+  dcSend({ type: 'ping', ts: Date.now() });
+  try { await bootApp(); } catch (e) { setStatus('App load failed', String(e), true); }
+}
+
+function gotoFallback(cfg, why) {
+  // Prefer the E2E-encrypted blind relay; fall back to the legacy plaintext
+  // proxy redirect only if no host key was published.
+  const slug = cfg.publish ? cfg.publish.account + '/' + cfg.publish.app : '';
+  if (cfg.secureRelayUrl && cfg.hostPubkey) {
+    setStatus('Switching to encrypted relay…', why + ' — no direct path, relaying securely');
+    connectSecureRelay(cfg, slug).then((ok) => {
+      if (!ok && cfg.mode === 'p2p+proxy' && cfg.proxyFallbackUrl) location.href = cfg.proxyFallbackUrl;
+    });
+    return true;
+  }
+  if (cfg.mode === 'p2p+proxy' && cfg.proxyFallbackUrl) {
+    setStatus('Switching to proxy…', why + ' — falling back to relay proxy');
+    setTimeout(() => { location.href = cfg.proxyFallbackUrl; }, 600);
+    return true;
+  }
+  return false;
+}
+
+async function main() {
+  const cfg = await loadConfig();
+  // Named published app: resolve a durable device credential and handshake for a
+  // fresh connection before connecting. This is what makes reload-after-powersave
+  // reconnect without re-scanning a QR code.
+  if (cfg.publish) {
+    const ready = await runPublishHandshake(cfg);
+    if (!ready) return;
+  }
+  if (cfg.mode === 'proxy') {
+    if (!gotoFallback(cfg, 'proxy mode')) setStatus('Proxy not configured', 'mode=proxy but no relay/proxy target', true);
+    return;
+  }
+
+  let connected = false;
+  const fallbackTimer = setTimeout(() => {
+    if (!connected) {
+      if (!gotoFallback(cfg, 'P2P timed out')) setStatus('Connection failed', 'P2P timed out and no proxy fallback', true);
+    }
+  }, cfg.connectTimeoutMs);
+
+  try {
+    const iceServers = cfg.iceServers && cfg.iceServers.length
+      ? cfg.iceServers
+      : cfg.stun.map((u) => ({ urls: u }));
+    const pc = new RTCPeerConnection({ iceServers: iceServers });
+    dc = pc.createDataChannel('llming', { ordered: true });
+    dc.binaryType = 'arraybuffer';
+    dc.onmessage = onDcMessage;
+    dc.onopen = async () => {
+      connected = true;
+      clearTimeout(fallbackTimer);
+      const path = await detectIcePath(pc);
+      publishConn('p2p', path);
+      setStatus('Connected', path === 'turn'
+        ? 'peer-to-peer via TURN relay'
+        : 'direct peer-to-peer link established');
+      // install tunnel shims
+      window.fetch = (input, init) => proxyFetch(input, init);
+      window.WebSocket = makeProxyWebSocket();
+      // keepalive ping (also yields a reconnect token)
+      dcSend({ type: 'ping', ts: Date.now() });
+      try { await bootApp(); }
+      catch (e) { setStatus('App load failed', String(e), true); }
+    };
+    pc.onconnectionstatechange = () => {
+      if (['failed', 'closed', 'disconnected'].includes(pc.connectionState) && !connected) {
+        clearTimeout(fallbackTimer);
+        if (!gotoFallback(cfg, 'P2P ' + pc.connectionState)) setStatus('Connection failed', 'P2P ' + pc.connectionState, true);
+      }
+    };
+
+    setStatus('Negotiating…', 'creating offer and gathering candidates');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitIceComplete(pc);
+
+    setStatus('Signaling…', cfg.signal === 'ws' ? 'exchanging SDP via relay' : 'exchanging SDP via HTTP');
+    const answerSdp = cfg.signal === 'ws' ? await signalWs(cfg, pc.localDescription.sdp)
+                                          : await signalHttp(cfg, pc.localDescription.sdp);
+    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+  } catch (e) {
+    clearTimeout(fallbackTimer);
+    if (!gotoFallback(cfg, 'signaling error')) setStatus('Connection failed', String(e), true);
+  }
+}
+
+main();
+</script>
+</body>
+</html>
