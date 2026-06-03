@@ -46,10 +46,13 @@
  */
 const WS_ID_LEN = 4;
 const qs = new URLSearchParams(location.search);
-// Host public-key fingerprint pinned out-of-band via the pairing QR's URL
-// fragment (#hk=…). The fragment is never sent to the relay, so it can't forge
-// it. Captured before any history.replaceState strips the fragment.
-const PINNED_HK = new URLSearchParams(location.hash.replace(/^#/, '')).get('hk') || '';
+// Pinned host-key fingerprint (#hk=…) AND the security key (#sk=…) ride in the
+// pairing QR's URL FRAGMENT. Browsers never send the fragment to the server, so
+// the relay sees neither — they travel out-of-band via the host-screen QR. This
+// lets ONE scan open + pair + key in. Captured before history.replaceState strips it.
+const _frag = new URLSearchParams(location.hash.replace(/^#/, ''));
+const PINNED_HK = _frag.get('hk') || '';
+const PROVIDED_SK = _frag.get('sk') || '';  // security key, if the invite carried it
 
 function setStatus(label, sub, isError) {
   const box = document.getElementById('llming-p2p-status');
@@ -170,9 +173,36 @@ async function runPublishHandshake(cfg) {
       }
     } catch (e) { /* fall through */ }
   }
-  if (!cred) {
-    setStatus('Pair this device', 'open the invite link or scan the QR code to connect', true);
-    return false;
+  // No credential (first visit on a bare URL, or after sign-out). Make this
+  // actionable instead of a dead end: scan the host's invite QR (or paste the
+  // link) right here to re-pair.
+  let note = '';
+  while (!cred) {
+    const invite = await promptForInvite(note);
+    if (invite === null) {
+      setStatus('Pair this device', 'scan the QR on the host screen to connect', true);
+      return false;
+    }
+    let ik = '', ihk = '';
+    try {
+      const u = new URL(invite, location.href);
+      ik = u.searchParams.get('k') || '';
+      ihk = new URLSearchParams((u.hash || '').replace(/^#/, '')).get('hk') || '';
+    } catch (e) { ik = invite; }  // maybe they pasted just the token
+    if (!ik) { note = "that link didn't contain an invite code"; continue; }
+    if (ihk && slug) { try { localStorage.setItem(hkKey(slug), ihk); } catch (e) {} }
+    setStatus('Pairing device…', 'redeeming your invite');
+    try {
+      const res = await fetch(cfg.redeemUrl, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ pairing_token: ik }), credentials: 'include',
+      });
+      if (res.ok) {
+        cred = (await res.json()).device_credential;
+        if (cred) { await putCred(slug, cred); history.replaceState(null, '', location.pathname); }
+        else note = 'pairing failed — try a fresh QR';
+      } else { note = 'invite invalid or expired — scan a fresh QR'; }
+    } catch (e) { note = 'network error — try again'; }
   }
   setStatus('Reconnecting…', 'verifying this device and opening a fresh connection');
   let conn;
@@ -399,9 +429,11 @@ async function bootApp() {
   }
 }
 
-// ---- E2E crypto (Web Crypto; byte-compatible with llming_com/secure.py) ----
-// ECDH P-256 -> HKDF-SHA256(salt=32 zeros, info) -> AES-256-GCM.
-const E2E_INFO = new TextEncoder().encode('llming-com/e2e/v1 aes-256-gcm');
+// ---- E2E crypto v2 (Web Crypto; byte-compatible with llming_com/secure.py) ----
+// ephemeral×ephemeral ECDH (PFS) + host-screen code → HKDF-SHA256(salt=SHA256(code),
+// info=v2‖transcript) → AES-256-GCM. Host ephemeral is signed by the pinned key.
+const E2E_INFO_V2 = new TextEncoder().encode('llming-com/e2e/v2 aes-256-gcm');
+const enc = (s) => new TextEncoder().encode(s);
 
 function b64uToBytes(s) {
   s = s.replace(/-/g, '+').replace(/_/g, '/'); s += '='.repeat((4 - s.length % 4) % 4);
@@ -415,21 +447,34 @@ function bytesToB64u(bytes) {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 function concatBytes(a, b) { const out = new Uint8Array(a.length + b.length); out.set(a, 0); out.set(b, a.length); return out; }
+function bytesEqual(a, b) { if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; }
 
 async function e2eFingerprint(pubRawB64) {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', b64uToBytes(pubRawB64)));
   return bytesToB64u(digest).slice(0, 16);
 }
-async function e2eDeriveKey(hostPubRawB64) {
-  const hostKey = await crypto.subtle.importKey('raw', b64uToBytes(hostPubRawB64), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+async function e2eGenEphemeral() {
   const eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
-  const ephPubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey));
-  const secret = await crypto.subtle.deriveBits({ name: 'ECDH', public: hostKey }, eph.privateKey, 256);
+  const pub = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey));
+  return { priv: eph.privateKey, pubB64: bytesToB64u(pub) };
+}
+// Verify a raw P1363 ECDSA P-256/SHA-256 signature against the pinned host key.
+async function e2eVerifySig(hostPubB64, dataBytes, sigB64) {
+  try {
+    const key = await crypto.subtle.importKey('raw', b64uToBytes(hostPubB64), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, b64uToBytes(sigB64), dataBytes);
+  } catch (e) { return false; }
+}
+function normalizeCodeBytes(code) { return enc(code.toUpperCase().replace(/[^A-Z0-9]/g, '')); }
+// Derive the v2 session key from our ephemeral, the host ephemeral, and the code.
+async function e2eDeriveV2(ephPriv, hostEphB64, infoBytes, code) {
+  const hostEph = await crypto.subtle.importKey('raw', b64uToBytes(hostEphB64), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const secret = await crypto.subtle.deriveBits({ name: 'ECDH', public: hostEph }, ephPriv, 256);
   const hkdfKey = await crypto.subtle.importKey('raw', secret, 'HKDF', false, ['deriveKey']);
-  const aesKey = await crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: E2E_INFO },
+  const salt = new Uint8Array(await crypto.subtle.digest('SHA-256', normalizeCodeBytes(code)));
+  const info = concatBytes(concatBytes(E2E_INFO_V2, new Uint8Array([0])), infoBytes);
+  return await crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: salt, info: info },
     hkdfKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-  return { aesKey, ephPubB64: bytesToB64u(ephPubRaw) };
 }
 async function e2eSeal(aesKey, bytes) {
   const nonce = crypto.getRandomValues(new Uint8Array(12));
@@ -442,81 +487,292 @@ async function e2eOpen(aesKey, blob) {
   return new Uint8Array(pt);
 }
 
-// Durable pin: remember the host key fingerprint per app (trust-on-first-use,
-// or pinned from the #hk fragment) so reconnects detect a swapped key.
+// Durable secrets in IndexedDB (mirrored to localStorage): the #hk pin and the
+// host-screen code (the "decryption key"). Only with the code can we decrypt.
 function hkKey(slug) { return 'llming-hk:' + slug; }
+function codeKey(slug) { return 'llming-code:' + slug; }
+function getStoredCode(slug) { try { return localStorage.getItem(codeKey(slug)) || ''; } catch (e) { return ''; } }
+async function putStoredCode(slug, code) {
+  try { localStorage.setItem(codeKey(slug), code); } catch (e) {}
+  const db = await openCredDb(); if (!db) return;
+  await new Promise((res) => { const r = db.transaction('creds', 'readwrite').objectStore('creds').put(code, codeKey(slug)); r.onsuccess = () => res(); r.onerror = () => res(); });
+}
 
-// Resident encrypted relay: run the SAME proxy shims (fetch/WebSocket) over an
-// AES-GCM WebSocket the hub forwards blindly. Frames: browser↔relay = kind||body
-// ('H' hello, 'A' sealed app frame, 'C' close).
-async function connectSecureRelay(cfg, slug) {
-  if (!cfg.secureRelayUrl || !cfg.hostPubkey) return false;
+// ---- Sign out: wipe all stored keys + logins (the app calls this) ----
+// Exposed on window so an app loaded through the viewer can offer a "sign out"
+// that fully forgets this device: the decryption code, the host-key pin, the
+// device credential — for one app or all. The app decides when to call it
+// (and typically reloads afterwards to force a fresh pair).
+let _publishSlug = '';
+window.LlmingPublish = {
+  get slug() { return _publishSlug; },
+  // Forget one app (defaults to the current one). Returns a promise.
+  async signOut(slug) {
+    slug = slug || _publishSlug;
+    if (!slug) return this.signOutAll();
+    [hkKey(slug), codeKey(slug), _credKey(slug)].forEach((k) => { try { localStorage.removeItem(k); } catch (e) {} });
+    const db = await openCredDb();
+    if (db) {
+      await new Promise((res) => {
+        const store = db.transaction('creds', 'readwrite').objectStore('creds');
+        ['code:' + slug, slug].forEach((key) => { try { store.delete(key); } catch (e) {} });
+        store.transaction.oncomplete = () => res();
+        store.transaction.onerror = () => res();
+      });
+    }
+  },
+  // Forget everything llming-com stored on this device.
+  async signOutAll() {
+    try { Object.keys(localStorage).filter((k) => k.indexOf('llming-') === 0).forEach((k) => localStorage.removeItem(k)); } catch (e) {}
+    await new Promise((res) => { try { const r = indexedDB.deleteDatabase(CRED_DB); r.onsuccess = r.onerror = r.onblocked = () => res(); } catch (e) { res(); } });
+  },
+};
+
+// Is the scanned text a pairing/invite URL (vs. the host-screen code)?
+function looksLikeUrl(v) { return /^[a-z][a-z0-9+.-]*:\/\//i.test(v) || v.indexOf('://') >= 0; }
+function looksLikeInvite(v) {
+  try { return !!new URL(v, location.href).searchParams.get('k'); } catch (e) { return false; }
+}
+// The security key from a scan: the one-QR invite carries it in its #sk fragment,
+// while a bare key QR is the key itself. Returns '' if the scan is neither.
+function keyFromScan(v) {
+  try {
+    const sk = new URLSearchParams(new URL(v, location.href).hash.replace(/^#/, '')).get('sk');
+    if (sk) return sk.trim();
+  } catch (e) {}
+  return (!looksLikeUrl(v) && v.length >= 8) ? v.trim() : '';
+}
+
+// Windowed camera QR scan (a guiding card, not fullscreen). Keeps scanning until
+// a code passes opts.accept(value) — so e.g. scanning the INVITE URL while we
+// want the CODE shows a hint and stays open. Resolves the value, or null.
+function scanQrCode(opts) {
+  opts = opts || {};
+  const accept = opts.accept || (() => true);
+  return new Promise((resolve) => {
+    (async () => {
+      try {
+        if (!('BarcodeDetector' in window) || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) { resolve(null); return; }
+        const fmts = await window.BarcodeDetector.getSupportedFormats();
+        if (!fmts.includes('qr_code')) { resolve(null); return; }
+        const det = new window.BarcodeDetector({ formats: ['qr_code'] });
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+
+        const backdrop = document.createElement('div');
+        backdrop.setAttribute('style', 'position:fixed;inset:0;z-index:1000000;background:rgba(0,0,0,.6)');
+        const card = document.createElement('div');
+        card.setAttribute('style', 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:1000001;background:#161b22;border:1px solid #30363d;border-radius:16px;padding:14px;width:min(86vw,340px);text-align:center;font-family:system-ui,sans-serif;color:#e6edf3;box-shadow:0 12px 50px rgba(0,0,0,.6)');
+        const vid = document.createElement('video'); vid.setAttribute('playsinline', 'true'); vid.muted = true; vid.autoplay = true;
+        vid.setAttribute('style', 'width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:12px;background:#000');
+        const titleEl = document.createElement('div'); titleEl.setAttribute('style', 'font-size:14px;font-weight:600;margin-bottom:8px'); titleEl.textContent = opts.title || 'Scan QR';
+        const hint = document.createElement('div'); hint.setAttribute('style', 'font-size:12px;color:#7d8590;margin-top:8px;min-height:16px'); hint.textContent = opts.hint || 'point your camera at the QR';
+        const cancel = document.createElement('button'); cancel.textContent = 'Cancel'; cancel.setAttribute('style', 'margin-top:10px;padding:8px 16px;border-radius:10px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font-size:13px');
+        card.appendChild(titleEl); card.appendChild(vid); card.appendChild(hint); card.appendChild(cancel);
+        document.body.appendChild(backdrop); document.body.appendChild(card); vid.srcObject = stream;
+
+        let done = false, lastBad = '';
+        const stop = (val) => { if (done) return; done = true; try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {} try { card.remove(); } catch (e) {} try { backdrop.remove(); } catch (e) {} resolve(val); };
+        cancel.onclick = () => stop(null);
+        backdrop.onclick = () => stop(null);
+        const tick = async () => {
+          if (done) return;
+          try {
+            const codes = await det.detect(vid);
+            if (codes && codes.length) {
+              // Both QRs may be in frame (they sit side by side on the host). Pick
+              // the FIRST detected code that passes the validator — so the key code
+              // is found even with the invite QR alongside it.
+              let picked = null;
+              for (let i = 0; i < codes.length; i++) {
+                const cv = (codes[i].rawValue || '').trim();
+                if (cv && accept(cv)) { picked = cv; break; }
+              }
+              if (picked) { stop(picked); return; }
+              const first = (codes[0].rawValue || '').trim();
+              if (first && first !== lastBad) { lastBad = first; hint.textContent = opts.reject || "that's the wrong QR — keep scanning"; hint.style.color = '#f87171'; }
+            }
+          } catch (e) {}
+          requestAnimationFrame(tick);
+        };
+        vid.addEventListener('loadeddata', () => requestAnimationFrame(tick), { once: true });
+      } catch (e) { resolve(null); }
+    })();
+  });
+}
+
+// Re-pair an un-credentialed device (e.g. after sign-out): scan the host's
+// invite QR or paste the invite link. Returns the invite URL/token, or null.
+function promptForInvite(note) {
+  return new Promise((resolve) => {
+    const box = document.getElementById('llming-p2p-status');
+    if (box) box.style.display = 'none';
+    const ov = document.createElement('div');
+    ov.setAttribute('style', 'position:fixed;inset:0;z-index:1000000;background:#11151c;color:#e6edf3;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-family:system-ui,sans-serif;padding:24px;text-align:center');
+    const canScan = ('BarcodeDetector' in window) && navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+    ov.innerHTML =
+      '<div style="font-size:17px;font-weight:600">Pair this device</div>' +
+      '<div style="font-size:13px;color:#7d8590;max-width:80vw">' + (canScan ? 'Scan the QR shown on the host, or paste the invite link.' : 'Paste the invite link shown on the host.') + '</div>' +
+      (note ? '<div style="color:#f87171;font-size:13px">' + note + '</div>' : '') +
+      '<input id="llming-inv-in" spellcheck="false" placeholder="https://…?k=…" style="width:min(80vw,360px);padding:12px;border-radius:10px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font-family:ui-monospace,monospace;font-size:14px;text-align:center">' +
+      '<div style="display:flex;gap:10px">' +
+      (canScan ? '<button id="llming-inv-scan" style="padding:10px 18px;border-radius:10px;border:1px solid #30363d;background:#161b22;color:#79c0ff;font-size:14px">Scan QR</button>' : '') +
+      '<button id="llming-inv-ok" style="padding:10px 18px;border-radius:10px;border:1px solid #1f6feb;background:#1f6feb;color:#fff;font-size:14px">Connect</button>' +
+      '</div>';
+    document.body.appendChild(ov);
+    const input = ov.querySelector('#llming-inv-in'); input.focus();
+    const finish = (val) => { try { ov.remove(); } catch (e) {} if (box) box.style.display = ''; resolve(val); };
+    ov.querySelector('#llming-inv-ok').onclick = () => { const v = input.value.trim(); if (v) finish(v); };
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const v = input.value.trim(); if (v) finish(v); } });
+    const sb = ov.querySelector('#llming-inv-scan');
+    if (sb) sb.onclick = () => scanQrCode({
+      title: 'Scan the invite QR',
+      hint: 'the QR that opens the board on a phone',
+      reject: "that's the key code — scan the INVITE QR instead",
+      accept: looksLikeInvite,
+    }).then((v) => { if (v) finish(v); });
+  });
+}
+
+// Ask the user for the host-screen code: paste field always; camera scan when
+// BarcodeDetector is available. Returns the code string, or null if cancelled.
+function promptForCode(retry) {
+  return new Promise((resolve) => {
+    const box = document.getElementById('llming-p2p-status');
+    if (box) box.style.display = 'none';
+    const ov = document.createElement('div');
+    ov.setAttribute('style', 'position:fixed;inset:0;z-index:1000000;background:#11151c;color:#e6edf3;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-family:system-ui,sans-serif;padding:24px;text-align:center');
+    const canScan = ('BarcodeDetector' in window) && navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+    ov.innerHTML =
+      '<div style="font-size:17px;font-weight:600">Pair this device</div>' +
+      '<div style="font-size:13px;color:#7d8590;max-width:80vw">Enter the security key shown on the host' + (canScan ? ', or scan it.' : '.') + '</div>' +
+      (retry ? '<div style="color:#f87171;font-size:13px">That key didn\'t match — try again.</div>' : '') +
+      '<input id="llming-code-in" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX-…" style="width:min(80vw,320px);padding:12px;border-radius:10px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font-family:ui-monospace,monospace;font-size:16px;text-align:center">' +
+      '<div style="display:flex;gap:10px">' +
+      (canScan ? '<button id="llming-code-scan" style="padding:10px 18px;border-radius:10px;border:1px solid #30363d;background:#161b22;color:#79c0ff;font-size:14px">Scan QR</button>' : '') +
+      '<button id="llming-code-ok" style="padding:10px 18px;border-radius:10px;border:1px solid #1f6feb;background:#1f6feb;color:#fff;font-size:14px">Connect</button>' +
+      '</div>';
+    document.body.appendChild(ov);
+    const input = ov.querySelector('#llming-code-in');
+    input.focus();
+    const finish = (val) => { try { ov.remove(); } catch (e) {} if (box) box.style.display = ''; resolve(val); };
+    ov.querySelector('#llming-code-ok').onclick = () => { const v = input.value.trim(); if (v) finish(v); };
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const v = input.value.trim(); if (v) finish(v); } });
+    const scanBtn = ov.querySelector('#llming-code-scan');
+    if (scanBtn) scanBtn.onclick = () => scanQrCode({
+      title: 'Scan the host QR',
+      hint: 'point your camera at the QR on the host',
+      reject: "that QR has no security key — scan the host's QR",
+      accept: (v) => !!keyFromScan(v),  // the key, or a one-QR invite carrying it in #sk
+    }).then((v) => { const k = v && keyFromScan(v); if (k) finish(k); });
+  });
+}
+
+// Transport-agnostic secure session. Runs the SAME two-step, code-bound
+// handshake over ANY open byte link (relay WebSocket OR WebRTC DataChannel):
+// connect → receive the signed response + canary probe → decrypt the probe with
+// the stored/entered code (else prompt) → connect. Frames are kind||body
+// ('H' hello, 'R' response, 'A' sealed app frame, 'C' close). `link` is
+// { send(Uint8Array), setOnFrame(cb), close() }, already open. `connInfo` is the
+// path label to publish on success. Resolves true when established.
+async function runSecureSession(cfg, slug, link, connInfo) {
+  if (!cfg.hostPubkey) return false;
   const fp = await e2eFingerprint(cfg.hostPubkey);
   const pinned = PINNED_HK || (slug ? localStorage.getItem(hkKey(slug)) : '');
   if (pinned && pinned !== fp) {
     setStatus('Security check failed', 'the host key does not match the pinned fingerprint — refusing to connect', true);
-    return true; // handled (do NOT fall through to a plaintext path)
+    try { link.close(); } catch (e) {}
+    return true; // handled — never fall through to a plaintext path
   }
   if (slug && !pinned) localStorage.setItem(hkKey(slug), fp); // trust on first use
-
-  setStatus('Connecting securely…', 'establishing an end-to-end encrypted relay');
-  const { aesKey, ephPubB64 } = await e2eDeriveKey(cfg.hostPubkey);
-  const u = new URL(cfg.secureRelayUrl, location.href);
-  u.protocol = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-  const ws = new (makeProxyWebSocket()._real)(u.href);
-  ws.binaryType = 'arraybuffer';
+  const eph = await e2eGenEphemeral();
 
   return await new Promise((resolve) => {
-    let settled = false;
-    const fail = (why) => { if (!settled) { settled = true; try { ws.close(); } catch (e) {} resolve(false); } if (why) { /* caller decides */ } };
+    let settled = false, aesKey = null;
+    let sendChain = Promise.resolve(), recvChain = Promise.resolve();
+    const done = (ok) => { if (settled) return; settled = true; if (!ok) { try { link.close(); } catch (e) {} } resolve(ok); };
+    link.onClose = () => { if (!aesKey) done(false); };
+    link.setOnFrame((u8) => { recvChain = recvChain.then(() => onFrame(u8)); });
+    link.send(concatBytes(new Uint8Array([0x48]), enc(JSON.stringify({ epub: eph.pubB64 }))));  // hello
 
-    let sendChain = Promise.resolve();     // serialize seals to preserve frame order
-    let recvChain = Promise.resolve();
+    async function onFrame(u8) {
+      const kind = u8[0];
+      if (kind === 0x52) { await onResponse(JSON.parse(new TextDecoder().decode(u8.slice(1)))); return; }   // 'R'
+      if (kind === 0x43) { setStatus('Disconnected', 'the secure session was closed', true); return; }      // 'C'
+      if (kind !== 0x41 || !aesKey) return;                                                                  // 'A'
+      let plain; try { plain = await e2eOpen(aesKey, u8.slice(1)); } catch (e) { return; }
+      const tag = plain[0], body = plain.slice(1);
+      if (tag === 0x4A) onDcMessage({ data: new TextDecoder().decode(body) });
+      else if (tag === 0x42) onDcMessage({ data: body });
+    }
 
-    ws.onopen = () => {
-      // hello: 'H' || {epub}
-      const hello = concatBytes(new Uint8Array([0x48]), new TextEncoder().encode(JSON.stringify({ epub: ephPubB64 })));
-      ws.send(hello.buffer);
-      // route the proxy client over this encrypted channel
+    async function tryCode(resp, infoBytes, code) {
+      try {
+        const k = await e2eDeriveV2(eph.priv, resp.epub, infoBytes, code);
+        const opened = await e2eOpen(k, b64uToBytes(resp.probe));
+        if (bytesEqual(opened, enc('llming-probe-v2:' + resp.nonce))) return k;
+      } catch (e) {}
+      return null;
+    }
+
+    async function onResponse(resp) {
+      const sigOk = await e2eVerifySig(cfg.hostPubkey, b64uToBytes(resp.epub), resp.sig);
+      if (!sigOk) { setStatus('Security check failed', 'host signature invalid — refusing to connect', true); done(false); return; }
+      const infoBytes = enc(cfg.hostPubkey + '|' + eph.pubB64 + '|' + resp.epub);
+      // Prefer a stored key; else the key from the invite's #sk fragment (one-scan
+      // pairing); else prompt. The relay never saw either.
+      let code = (slug ? getStoredCode(slug) : '') || PROVIDED_SK || '';
+      let key = code ? await tryCode(resp, infoBytes, code) : null;
+      let retried = false;
+      while (!key) {
+        const entered = await promptForCode(retried); retried = true;
+        if (entered === null) { setStatus('Pairing needed', 'enter the host-screen code to connect', true); done(false); return; }
+        code = entered; key = await tryCode(resp, infoBytes, code);
+      }
+      aesKey = key;
+      if (slug) await putStoredCode(slug, code);
       dc = {
         send: (data) => {
           sendChain = sendChain.then(async () => {
             const tagged = (typeof data === 'string')
-              ? concatBytes(new Uint8Array([0x4A]), new TextEncoder().encode(data))   // 'J'
-              : concatBytes(new Uint8Array([0x42]), new Uint8Array(data.buffer || data)); // 'B'
+              ? concatBytes(new Uint8Array([0x4A]), enc(data))                                  // 'J'
+              : concatBytes(new Uint8Array([0x42]), new Uint8Array(data.buffer || data));        // 'B'
             const sealed = await e2eSeal(aesKey, tagged);
-            ws.send(concatBytes(new Uint8Array([0x41]), sealed).buffer);                  // 'A'
+            link.send(concatBytes(new Uint8Array([0x41]), sealed));                              // 'A'
           });
         },
       };
-      settled = true;
-      connectedSecure(cfg, aesKey, ws);
-      resolve(true);
-    };
-    ws.onmessage = (ev) => {
-      recvChain = recvChain.then(async () => {
-        const u8 = new Uint8Array(ev.data);
-        const kind = u8[0];
-        if (kind === 0x43) { setStatus('Disconnected', 'the secure session was closed', true); return; }
-        if (kind !== 0x41) return;
-        let plain;
-        try { plain = await e2eOpen(aesKey, u8.slice(1)); } catch (e) { return; }
-        const tag = plain[0]; const body = plain.slice(1);
-        if (tag === 0x4A) onDcMessage({ data: new TextDecoder().decode(body) });
-        else if (tag === 0x42) onDcMessage({ data: body });
-      });
-    };
-    ws.onerror = () => fail('relay error');
-    ws.onclose = () => fail('relay closed');
+      connectedSecure(cfg, connInfo);
+      done(true);
+    }
   });
 }
 
+// Encrypted relay transport: a blind WebSocket the hub forwards.
+async function connectSecureRelay(cfg, slug) {
+  if (!cfg.secureRelayUrl || !cfg.hostPubkey) return false;
+  setStatus('Connecting…', 'establishing an end-to-end encrypted channel');
+  const u = new URL(cfg.secureRelayUrl, location.href);
+  u.protocol = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+  const ws = new (makeProxyWebSocket()._real)(u.href);
+  ws.binaryType = 'arraybuffer';
+  const opened = await new Promise((res) => { ws.onopen = () => res(true); ws.onerror = () => res(false); });
+  if (!opened) return false;
+  const link = {
+    send: (u8) => ws.send(u8.buffer),
+    setOnFrame: (cb) => { ws.onmessage = (ev) => cb(new Uint8Array(ev.data)); },
+    close: () => { try { ws.close(); } catch (e) {} },
+    onClose: null,
+  };
+  ws.onclose = () => { if (link.onClose) link.onClose(); };
+  return await runSecureSession(cfg, slug, link, { transport: 'proxy', path: 'e2e' });
+}
+
 let _secureBooted = false;
-async function connectedSecure(cfg, aesKey, ws) {
+async function connectedSecure(cfg, connInfo) {
   if (_secureBooted) return;
   _secureBooted = true;
-  publishConn('proxy', 'e2e');  // encrypted blind relay through the hub
-  setStatus('Connected', 'end-to-end encrypted relay established');
+  publishConn(connInfo.transport, connInfo.path);
+  setStatus('Connected', 'end-to-end encrypted channel established');
   window.fetch = (input, init) => proxyFetch(input, init);
   window.WebSocket = makeProxyWebSocket();
   dcSend({ type: 'ping', ts: Date.now() });
@@ -544,6 +800,7 @@ function gotoFallback(cfg, why) {
 
 async function main() {
   const cfg = await loadConfig();
+  if (cfg.publish) _publishSlug = cfg.publish.account + '/' + cfg.publish.app;  // for LlmingPublish.signOut()
   // Named published app: resolve a durable device credential and handshake for a
   // fresh connection before connecting. This is what makes reload-after-powersave
   // reconnect without re-scanning a QR code.
@@ -568,24 +825,44 @@ async function main() {
       ? cfg.iceServers
       : cfg.stun.map((u) => ({ urls: u }));
     const pc = new RTCPeerConnection({ iceServers: iceServers });
-    dc = pc.createDataChannel('llming', { ordered: true });
-    dc.binaryType = 'arraybuffer';
-    dc.onmessage = onDcMessage;
-    dc.onopen = async () => {
+    const channel = pc.createDataChannel('llming', { ordered: true });
+    channel.binaryType = 'arraybuffer';
+    channel.onopen = async () => {
       connected = true;
       clearTimeout(fallbackTimer);
       const path = await detectIcePath(pc);
-      publishConn('p2p', path);
-      setStatus('Connected', path === 'turn'
-        ? 'peer-to-peer via TURN relay'
-        : 'direct peer-to-peer link established');
-      // install tunnel shims
-      window.fetch = (input, init) => proxyFetch(input, init);
-      window.WebSocket = makeProxyWebSocket();
-      // keepalive ping (also yields a reconnect token)
-      dcSend({ type: 'ping', ts: Date.now() });
-      try { await bootApp(); }
-      catch (e) { setStatus('App load failed', String(e), true); }
+      const slug = cfg.publish ? cfg.publish.account + '/' + cfg.publish.app : '';
+      // P2P is code-bound too: run the SAME secure handshake over the DataChannel.
+      // A malicious signaling relay can't MITM it and can't connect without the
+      // host-screen code. Requires a published host key (#hk / host_pubkey).
+      if (cfg.hostPubkey) {
+        const link = {
+          send: (u8) => channel.send(u8),
+          setOnFrame: (cb) => {
+            channel.onmessage = (ev) => {
+              const d = ev.data;
+              cb(d instanceof ArrayBuffer ? new Uint8Array(d) : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer) : enc(d));
+            };
+          },
+          close: () => { try { channel.close(); } catch (e) {} },
+          onClose: null,
+        };
+        channel.onclose = () => { if (link.onClose) link.onClose(); };
+        const ok = await runSecureSession(cfg, slug, link, { transport: 'p2p', path: path });
+        if (!ok && !gotoFallback(cfg, 'secure handshake failed')) {
+          setStatus('Connection failed', 'could not complete the secure handshake', true);
+        }
+      } else {
+        // Legacy unencrypted P2P (no host key published) — relies on WebRTC DTLS.
+        dc = channel;
+        channel.onmessage = onDcMessage;
+        publishConn('p2p', path);
+        setStatus('Connected', path === 'turn' ? 'peer-to-peer via TURN relay' : 'direct peer-to-peer link established');
+        window.fetch = (input, init) => proxyFetch(input, init);
+        window.WebSocket = makeProxyWebSocket();
+        dcSend({ type: 'ping', ts: Date.now() });
+        try { await bootApp(); } catch (e) { setStatus('App load failed', String(e), true); }
+      }
     };
     pc.onconnectionstatechange = () => {
       if (['failed', 'closed', 'disconnected'].includes(pc.connectionState) && !connected) {
