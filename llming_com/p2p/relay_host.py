@@ -21,12 +21,14 @@ import asyncio
 import json
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib import error, request
 
 from llming_com.p2p.admission import P2PAdmissionClient
-from llming_com.p2p.proxy import DataChannelProxy
+from llming_com.p2p.secure_relay import SecureProxySession
 from llming_com.p2p.webrtc import WebRTCPeerRegistry
+from llming_com.secure import HostIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +41,22 @@ class RelayHost:
         room: str,
         local_base: str,
         *,
+        identity: HostIdentity,
+        code: str,
+        on_pair_request: Callable[[], Awaitable[None]] | None = None,
+        on_connected: Callable[[], Awaitable[None]] | None = None,
         relay_endpoint: str = "",
         admission_key: str = "",
         admission: P2PAdmissionClient | None = None,
         stun_servers: list[str] | None = None,
         ice_servers: list[dict[str, Any]] | None = None,
         ice_endpoint: str = "",
-        sdp_poll_interval: float = 0.25,
+        # The relay long-polls (holds each request ~25s until an offer arrives),
+        # so the host makes ~1 request per hold window even when idle. This is
+        # only the small pause between a returned poll and the next one — NOT a
+        # busy 4x/sec loop. Keeping it at 1s caps the worst case (an old relay
+        # that returns immediately) at ~1 req/s instead of hundreds of k/day.
+        sdp_poll_interval: float = 1.0,
         room_ttl_ms: int = 86_400_000,
         room_renew_interval: float = 1800.0,
         app_id: str = "",
@@ -58,6 +69,13 @@ class RelayHost:
         self._admission = admission
         self.room = room
         self.local_base = local_base.rstrip("/")
+        # End-to-end: the WebRTC DataChannel carries the SAME code-bound secure
+        # session as the relay path, so direct P2P also refuses to connect
+        # without the host-screen code (and resists a signaling-relay MITM).
+        self._identity = identity
+        self._code = code
+        self._on_pair_request = on_pair_request
+        self._on_connected = on_connected
         self._stun = stun_servers
         # Static ICE servers (TURN with credentials), or an endpoint that mints
         # fresh short-lived ones per offer.  Either makes the host reachable when
@@ -76,7 +94,7 @@ class RelayHost:
         self._task: asyncio.Task[None] | None = None
         self._renew_task: asyncio.Task[None] | None = None
         self._peers = WebRTCPeerRegistry()
-        self._proxies: dict[str, DataChannelProxy] = {}
+        self._sessions: dict[str, SecureProxySession] = {}
 
     async def start(self) -> None:
         """Register the room and begin polling for offers."""
@@ -119,9 +137,9 @@ class RelayHost:
         self._task = None
         self._renew_task = None
         await self._peers.close_all()
-        for proxy in list(self._proxies.values()):
-            await proxy.stop()
-        self._proxies.clear()
+        for session in list(self._sessions.values()):
+            await session.stop()
+        self._sessions.clear()
 
     async def _loop(self) -> None:
         while self._running:
@@ -138,30 +156,30 @@ class RelayHost:
 
     async def _handle_offer(self, message: dict[str, Any]) -> None:
         session_id = str(message.get("id") or secrets.token_hex(8))
-        proxy_holder: dict[str, DataChannelProxy] = {}
+        session_holder: dict[str, SecureProxySession] = {}
 
         async def on_message(data: bytes | str) -> None:
-            proxy = proxy_holder.get("proxy")
-            if proxy is not None:
-                await proxy.handle_message(data)
-
-        async def on_open() -> None:
-            proxy = proxy_holder.get("proxy")
-            if proxy is not None:
-                await proxy.start()
+            session = session_holder.get("session")
+            if session is not None:
+                await session.feed(data)
 
         ice_servers = await self._resolve_ice_servers()
         peer, answer_sdp = await self._peers.create_peer(
             session_id,
             message["sdp"],
             on_message=on_message,
-            on_open=on_open,
             stun_servers=self._stun,
             ice_servers=ice_servers,
         )
-        proxy = DataChannelProxy(peer, local_base=self.local_base)
-        proxy_holder["proxy"] = proxy
-        self._proxies[session_id] = proxy
+        # The DataChannel is the byte link for a code-bound secure session: the
+        # browser sends its hello, we answer with a signed ephemeral + probe, and
+        # nothing is proxied until the host-screen code matches.
+        session = SecureProxySession(
+            peer.send, self._identity, local_base=self.local_base, code=self._code, forwarded_via="p2p",
+            on_pair_request=self._on_pair_request, on_connected=self._on_connected,
+        )
+        session_holder["session"] = session
+        self._sessions[session_id] = session
         await self._admission.sdp_send(self.room, {"type": "answer", "sdp": answer_sdp, "id": session_id})
         logger.debug("relay host answered offer for session %s", session_id)
 

@@ -131,11 +131,17 @@ class P2PAdmissionClient:
         )
 
     async def sdp_inbox(self, room: str) -> list[dict[str, Any]]:
-        """Poll for SDP messages a viewer WebSocket left for the host."""
+        """Long-poll for SDP messages a viewer WebSocket left for the host.
+
+        The relay holds this request open until an offer arrives (or it times out
+        server-side), so an idle host makes ~1 request per hold window instead of
+        hammering the endpoint. The client timeout must exceed the server hold.
+        """
 
         body = await self._request(
             self.room_http_url(room, "sdp-inbox"),
             authorized=True,
+            timeout=35.0,
         )
         messages = body.get("messages", [])
         return messages if isinstance(messages, list) else []
@@ -157,6 +163,7 @@ class P2PAdmissionClient:
         method: str = "GET",
         body: dict[str, Any] | None = None,
         authorized: bool = False,
+        timeout: float = 15.0,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._request_sync,
@@ -164,6 +171,7 @@ class P2PAdmissionClient:
             method=method,
             body=body,
             authorized=authorized,
+            timeout=timeout,
         )
 
     def _request_sync(
@@ -173,6 +181,7 @@ class P2PAdmissionClient:
         method: str,
         body: dict[str, Any] | None,
         authorized: bool,
+        timeout: float = 15.0,
     ) -> dict[str, Any]:
         data = None if body is None else json.dumps(body).encode("utf-8")
         headers = {
@@ -186,7 +195,7 @@ class P2PAdmissionClient:
             headers["authorization"] = f"Bearer {self.admission_key}"
         req = request.Request(url, method=method, data=data, headers=headers)
         try:
-            with request.urlopen(req, timeout=15) as resp:
+            with request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else {}
         except error.HTTPError as exc:
