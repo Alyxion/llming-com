@@ -15,7 +15,7 @@ from llming_com import (
     serve_published,
 )
 from llming_com.access.remote import InMemoryAccessStore
-from llming_com.publish import normalize_slug
+from llming_com.publish import normalize_app_path, normalize_slug
 
 # ---- registry ----
 
@@ -26,6 +26,24 @@ def test_normalize_slug() -> None:
     for bad in ["", "-x", "a/b", "white space", "x" * 64]:
         with pytest.raises(ValueError):
             normalize_slug(bad)
+
+
+def test_normalize_app_path_multi_segment() -> None:
+    assert normalize_app_path("board") == "board"
+    assert normalize_app_path("Com/Samples/Board") == "com/samples/board"
+    assert normalize_app_path("/com/samples/board/") == "com/samples/board"
+    assert normalize_app_path("com//x/") == "com/x"  # empty segments collapse
+    for bad in ["", "/", "com/-bad", "com/white space", "com/" + "x" * 64]:
+        with pytest.raises(ValueError):
+            normalize_app_path(bad)
+
+
+def test_publish_resolve_multi_segment_app() -> None:
+    reg = PublishRegistry()
+    rec = reg.publish("llming", "com/samples/board", ttl_seconds=0)
+    assert rec.slug == "llming/com/samples/board"
+    assert reg.resolve("llming", "com/samples/board") is not None
+    assert reg.resolve("LLMING", "Com/Samples/Board") is not None
 
 
 def test_publish_resolve_and_expiry() -> None:

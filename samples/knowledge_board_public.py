@@ -4,7 +4,7 @@ Unlike ``knowledge_board_demo`` (LAN-only, runs its own hub), this connects the
 host stack to the **already-deployed** hub at ``hub.openhort.ai`` so the phone
 reaches a public URL from anywhere — including cellular/5G:
 
-    PHONE (scan QR over 5G):  https://hub.openhort.ai/{account}/{app}?k=<pairing>
+    PHONE (scan QR over 5G):  https://hub.openhort.ai/{owner}/{app-path}?k=<pairing>
 
 The host runs three things locally (no inbound firewall rule needed):
 
@@ -22,8 +22,8 @@ proxy) and the board displays it.
 Configuration comes from the environment (kept out of source / git):
 
     HUB                 hub base (default https://hub.openhort.ai)
-    BOARD_ACCOUNT       account slug      (default team)
-    BOARD_APP           app slug          (default board)
+    BOARD_ACCOUNT       owner handle (user|org|apikey)  (default llming)
+    BOARD_APP           app path, may be multi-segment   (default com/samples/board)
     BOARD_ROOM          relay room id     (required)
     BOARD_CONNECTION_KEY  host tunnel key (required — proxy fallback)
     HUB_ADMISSION_KEY   relay admission key (required — P2P signaling)
@@ -69,14 +69,16 @@ async def main() -> None:
     args = parser.parse_args()
 
     hub = os.environ.get("HUB", "https://hub.openhort.ai").rstrip("/")
-    account = os.environ.get("BOARD_ACCOUNT", "team")
-    app_slug = os.environ.get("BOARD_APP", "board")
+    # owner is a typed principal (user | org | apikey); app is a multi-segment path.
+    account = os.environ.get("BOARD_ACCOUNT", "llming")           # org handle
+    app_slug = os.environ.get("BOARD_APP", "com/samples/board")   # app path under the owner
     room = _require("BOARD_ROOM")
     connection_key = _require("BOARD_CONNECTION_KEY")
     admission_key = _require("HUB_ADMISSION_KEY")
     invite = _require("BOARD_INVITE")
     host_id = _require("BOARD_HOST_ID")
     identity = HostIdentity.from_pem(base64.b64decode(_require("HOST_IDENTITY_B64")).decode())
+    pairing_code = _require("BOARD_PAIRING_CODE")  # the host-screen decryption key
 
     app_local = f"http://127.0.0.1:{args.app_port}"
     relay_endpoint = f"{hub}/relay"
@@ -85,7 +87,16 @@ async def main() -> None:
     # Per-room shard: this app's relay lives in its own DO isolate (keyed host:room).
     secure_relay_url = f"{hub_ws}/securerelay/{host_id}/r/{room}/host?key={connection_key}"
 
-    board_app = build_board_app("board", pairing_url=invite)
+    board_app = build_board_app("board", pairing_url=invite, pairing_code=pairing_code)
+    notify_pairing = board_app.state.notify_pairing
+
+    # Show the hovering pairing QR on the host when a device starts connecting,
+    # hide it once that device proves it has the code. Works for P2P and relay.
+    async def on_pair_request() -> None:
+        await notify_pairing("requested")
+
+    async def on_connected() -> None:
+        await notify_pairing("connected")
 
     # Proxy fallback: outbound tunnel to the hub.
     tunnel = TunnelClient(hub, connection_key, local_url=app_local)
@@ -95,6 +106,10 @@ async def main() -> None:
     relay_host = RelayHost(
         room,
         local_base=app_local,
+        identity=identity,
+        code=pairing_code,  # P2P is now code-bound too — same host-screen code
+        on_pair_request=on_pair_request,
+        on_connected=on_connected,
         relay_endpoint=relay_endpoint,
         admission_key=admission_key,
         ice_endpoint=ice_endpoint,
@@ -109,7 +124,10 @@ async def main() -> None:
     await relay_host.start()
     # E2E-encrypted blind-relay fallback: the hub forwards only ciphertext.
     secure_task = asyncio.create_task(
-        run_secure_relay_host(secure_relay_url, identity=identity, local_base=app_local)
+        run_secure_relay_host(
+            secure_relay_url, identity=identity, local_base=app_local, code=pairing_code,
+            on_pair_request=on_pair_request, on_connected=on_connected,
+        )
     )
 
     host_view = f"http://127.0.0.1:{args.app_port}/?role=host&qr=1"

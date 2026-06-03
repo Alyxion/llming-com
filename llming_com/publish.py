@@ -42,7 +42,7 @@ def _hash(value: str) -> str:
 
 
 def normalize_slug(value: str) -> str:
-    """Lower-case and validate one path segment (account or app name)."""
+    """Lower-case and validate one path segment (owner handle or app segment)."""
 
     slug = value.strip().lower()
     if not SLUG_RE.match(slug):
@@ -50,6 +50,15 @@ def normalize_slug(value: str) -> str:
             f"invalid slug {value!r}: use 1-63 chars of a-z, 0-9, hyphen, not starting with a hyphen"
         )
     return slug
+
+
+def normalize_app_path(value: str) -> str:
+    """Validate a (possibly multi-segment) app path, e.g. ``com/samples/board``."""
+
+    parts = [p for p in value.strip().lower().split("/") if p]
+    if not parts:
+        raise ValueError("empty app path")
+    return "/".join(normalize_slug(p) for p in parts)
 
 
 @dataclass
@@ -135,7 +144,7 @@ class PublishRegistry:
         ttl_seconds: float = NO_EXPIRY,
     ) -> PublishedApp:
         account = normalize_slug(account)
-        app = normalize_slug(app)
+        app = normalize_app_path(app)
         record = PublishedApp(
             account=account,
             app=app,

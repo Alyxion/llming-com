@@ -11,7 +11,7 @@ The board is published at a stable URL and bound to the machine's LAN IP so a
 phone on the same Wi-Fi can reach it:
 
     HOST  (this screen):  http://127.0.0.1:8791/?role=host&qr=1
-    PHONE (scan the QR):  http://<LAN-IP>:8790/team/board?k=<pairing>
+    PHONE (scan the QR):  http://<LAN-IP>:8790/llming/com/samples/board?k=<pairing>
 
 Open the HOST url on this machine — it shows the board **and a QR code**.
 Scan the QR with your phone: it pairs once (durable credential), connects over
@@ -63,8 +63,8 @@ async def main() -> None:
     parser.add_argument("--ip", default="", help="LAN IP advertised in the QR (auto-detected if empty)")
     parser.add_argument("--hub-port", type=int, default=8790)
     parser.add_argument("--app-port", type=int, default=8791)
-    parser.add_argument("--account", default="team")
-    parser.add_argument("--app", default="board")
+    parser.add_argument("--account", default="llming", help="owner handle (user|org|apikey)")
+    parser.add_argument("--app", default="com/samples/board", help="app path (may be multi-segment)")
     parser.add_argument("--ttl", type=float, default=3600.0, help="published link lifetime (s); 0 = no expiry")
     args = parser.parse_args()
 

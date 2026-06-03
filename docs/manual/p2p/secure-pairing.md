@@ -14,7 +14,7 @@ encrypted-relay** transports.
 ## Why one-step pairing is not enough
 
 The original flow paired a device with a single token in the URL
-(`…/{account}/{app}?k=<token>`):
+(`…/{owner}/{app-path}?k=<token>`):
 
 ```mermaid
 sequenceDiagram

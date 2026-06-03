@@ -124,7 +124,8 @@ links keep working unchanged:
 - `GET /proxy/{host}/…` — direct proxy browsing (unchanged)
 - `GET /t/{host}/{token}` — token login (unchanged)
 - `GET /p2p/viewer.html` — raw P2P viewer (unchanged)
-- `GET /{account}/{app}` — new durable launcher (resolves to the above)
+- `GET /{owner}/{app-path}` — durable launcher (owner = user/org/api-key principal;
+  app path may be multi-segment, e.g. `com/samples/board`); resolves to the above
 
 ## Backends
 

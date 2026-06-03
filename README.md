@@ -43,8 +43,10 @@ here first and reused by product repositories.
 
 This includes:
 
-- named publishing: stable `apps.example.com/{account}/{app}` URLs with a link
-  lifetime and durable reconnect (`PublishRegistry`, `mount_publish`, `serve_published`);
+- named publishing: stable `apps.example.com/{owner}/{app-path}` URLs (owner is a
+  user/org/api-key principal; the app path may be multi-segment, e.g.
+  `com/samples/board`) with a link lifetime and durable reconnect
+  (`PublishRegistry`, `mount_publish`, `serve_published`);
 - the public relay HTTP/WebSocket contract;
 - server-side P2P relay assets with Cloudflare as one deployment backend;
 - opaque pairing-token redemption;
@@ -106,7 +108,7 @@ Runnable examples live in [`samples/`](samples/):
   (`create_access_app`) + an outbound `TunnelClient` expose a local app at
   `/proxy/{host}/`. This is the P2P fallback transport.
 - `publish_demo.py` — **named publishing**: a stable, bookmarkable URL
-  (`/{account}/{app}`) with a link lifetime, one-time QR/`?k=` pairing, and
+  (`/{owner}/{app-path}`) with a link lifetime, one-time QR/`?k=` pairing, and
   **durable reconnect** — reload after powersave / 10 minutes / the next day and
   it re-handshakes from a stored device credential, no re-scan. See
   [Connectivity](docs/manual/p2p/connectivity.md).
