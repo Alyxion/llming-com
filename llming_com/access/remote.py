@@ -352,10 +352,13 @@ class TunnelClient:
 
         self._running = True
         ws_base = self.access_server_url.replace("http://", "ws://").replace("https://", "wss://")
-        tunnel_url = f"{ws_base}/api/access/tunnel?key={self.connection_key}"
+        tunnel_url = f"{ws_base}/api/access/tunnel"
+        # Send the connection key in a header, not the URL, so it never lands in
+        # access logs or proxy history. The hub falls back to ?key= for old hosts.
+        headers = {"X-OpenHort-Connection-Key": self.connection_key}
         while self._running:
             try:
-                async with websockets.connect(tunnel_url) as websocket:
+                async with websockets.connect(tunnel_url, additional_headers=headers) as websocket:
                     self._tunnel_ws = websocket
                     await self._read_welcome(websocket)
                     await self._message_loop(websocket)
@@ -649,7 +652,10 @@ def create_access_app(
 
     @app.websocket("/api/access/tunnel")
     async def host_tunnel(websocket: WebSocket) -> None:
-        host = access_store.get_host_by_key(websocket.query_params.get("key", ""))
+        # Prefer the key in a header (kept out of URLs / access logs); fall back to
+        # the legacy ?key= so older hosts still connect.
+        key = websocket.headers.get("x-openhort-connection-key") or websocket.query_params.get("key", "")
+        host = access_store.get_host_by_key(key)
         if not host:
             await websocket.close(code=4003, reason="Invalid connection key")
             return

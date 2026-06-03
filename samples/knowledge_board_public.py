@@ -85,7 +85,9 @@ async def main() -> None:
     ice_endpoint = f"{hub}/api/ice"
     hub_ws = hub.replace("https://", "wss://").replace("http://", "ws://")
     # Per-room shard: this app's relay lives in its own DO isolate (keyed host:room).
-    secure_relay_url = f"{hub_ws}/securerelay/{host_id}/r/{room}/host?key={connection_key}"
+    # The connection key travels in a header (passed to run_secure_relay_host), not
+    # the URL, so the bare endpoint is what we connect to.
+    secure_relay_url = f"{hub_ws}/securerelay/{host_id}/r/{room}/host"
 
     board_app = build_board_app("board", pairing_url=invite, pairing_code=pairing_code)
     notify_pairing = board_app.state.notify_pairing
@@ -126,6 +128,7 @@ async def main() -> None:
     secure_task = asyncio.create_task(
         run_secure_relay_host(
             secure_relay_url, identity=identity, local_base=app_local, code=pairing_code,
+            connection_key=connection_key,  # sent as a header, not in the URL
             on_pair_request=on_pair_request, on_connected=on_connected,
         )
     )

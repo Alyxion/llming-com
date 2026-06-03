@@ -36,10 +36,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 
 from llming_com.p2p.proxy import DataChannelProxy
-from llming_com.secure import HostIdentity, SecureChannel, SecureFramer
+from llming_com.secure import (
+    EphemeralKey,
+    HostIdentity,
+    SecureFramer,
+    _b64u_decode,
+    derive_session_key,
+    session_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,34 +55,34 @@ SID_LEN = 16
 KIND_HELLO = b"H"
 KIND_APP = b"A"
 KIND_CLOSE = b"C"
+KIND_RESPONSE = b"R"  # host → device: signed ephemeral + canary probe
+
+PROBE_PREFIX = b"llming-probe-v2:"
 
 LinkSend = Callable[[bytes], Awaitable[None]]
 
 
-class _SidLink:
-    """A per-session view of the relay link that tags frames with the sid.
+class _AppLink:
+    """SecureFramer's transport ``peer``: prepends the ``'A'`` app-frame tag."""
 
-    Presented to :class:`SecureFramer` as its transport ``peer``: the framer
-    seals a DataChannelProxy frame, and this prepends ``sid || 'A'`` so the
-    relay routes it to the right browser.
-    """
-
-    def __init__(self, send: LinkSend, sid: bytes) -> None:
+    def __init__(self, send: LinkSend) -> None:
         self._send = send
-        self._prefix = sid + KIND_APP
 
     async def send(self, blob: bytes) -> None:
-        await self._send(self._prefix + blob)
+        await self._send(KIND_APP + blob)
 
 
-class SecureRelayHost:
-    """Terminate many encrypted browser sessions arriving over one relay link.
+class SecureProxySession:
+    """One end-to-end-encrypted proxy session over a byte link.
 
-    ``send`` is how this host writes a frame toward the relay (e.g. a WebSocket
-    ``send``).  Feed inbound relay frames to :meth:`feed`.  One
-    :class:`DataChannelProxy` is created per browser session and forwards to the
-    local app exactly like the P2P path — the only difference is the transport
-    and the encryption layer.
+    Transport-agnostic: the SAME session logic runs over a relay WebSocket *and*
+    over a WebRTC DataChannel — only the byte link differs.  This is what binds
+    BOTH transports to the host-screen code.
+
+    Wire frames are ``kind || body``: ``H`` hello (device→host, ``{epub}``),
+    ``R`` response (host→device, signed ephemeral + canary probe), ``A`` sealed
+    app frame (both ways), ``C`` close.  ``send`` writes one ``kind||body`` frame
+    to the link.
     """
 
     def __init__(
@@ -83,67 +91,158 @@ class SecureRelayHost:
         identity: HostIdentity,
         *,
         local_base: str,
+        code: str,
         forwarded_via: str = "proxy",
+        on_pair_request: Callable[[], Awaitable[None]] | None = None,
+        on_connected: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._send = send
         self._identity = identity
         self._local_base = local_base
+        self._code = code  # the host-screen code; the relay never sees it
         self._forwarded_via = forwarded_via
-        self._sessions: dict[str, tuple[DataChannelProxy, SecureFramer, SecureChannel]] = {}
+        # on_pair_request fires when a device starts connecting (hello) — the host
+        # can show the pairing QR then. on_connected fires when the device's first
+        # encrypted frame proves it has the code — the host can hide the QR.
+        self._on_pair_request = on_pair_request
+        self._on_connected = on_connected
+        self._connected_fired = False
+        self._framer: SecureFramer | None = None
+        self._proxy: DataChannelProxy | None = None
 
-    async def feed(self, frame: bytes) -> None:
-        """Handle one ``sid || kind || body`` frame from the relay."""
+    @property
+    def established(self) -> bool:
+        return self._proxy is not None
 
-        if len(frame) < SID_LEN + 1:
+    async def feed(self, frame: bytes | str) -> None:
+        raw = frame if isinstance(frame, bytes) else frame.encode("latin-1")
+        if not raw:
             return
-        sid = frame[:SID_LEN].decode("ascii", "replace")
-        kind = frame[SID_LEN : SID_LEN + 1]
-        body = frame[SID_LEN + 1 :]
+        kind, body = raw[:1], raw[1:]
         if kind == KIND_HELLO:
-            await self._open(sid, frame[:SID_LEN], body)
-        elif kind == KIND_APP:
-            await self._app(sid, body)
+            await self._handshake(body)
+        elif kind == KIND_APP and self._proxy is not None and self._framer is not None:
+            try:
+                decoded = self._framer.feed(body)
+            except Exception as exc:  # tampered/garbage ciphertext (or wrong code)
+                logger.debug("secure session frame rejected: %s", exc)
+                return
+            if not self._connected_fired:  # first valid frame ⇒ the device has the code
+                self._connected_fired = True
+                await self._fire(self._on_connected)
+            await self._proxy.handle_message(decoded)
         elif kind == KIND_CLOSE:
-            await self._close(sid)
+            await self.stop()
 
-    async def _open(self, sid: str, sid_bytes: bytes, body: bytes) -> None:
+    @staticmethod
+    async def _fire(cb: Callable[[], Awaitable[None]] | None) -> None:
+        if cb is None:
+            return
         try:
-            epub = json.loads(body).get("epub", "")
-            channel = self._identity.derive(epub)
-        except Exception as exc:  # bad/forged hello — drop the session
-            logger.debug("secure relay hello rejected for %s: %s", sid, exc)
-            return
-        framer = SecureFramer(_SidLink(self._send, sid_bytes), channel)
-        proxy = DataChannelProxy(framer, local_base=self._local_base, forwarded_via=self._forwarded_via)
-        await proxy.start()
-        self._sessions[sid] = (proxy, framer, channel)
-        logger.debug("secure relay session opened: %s", sid)
+            await cb()
+        except Exception as exc:  # never let a UI hook break the session
+            logger.debug("secure session callback error: %s", exc)
 
-    async def _app(self, sid: str, body: bytes) -> None:
-        session = self._sessions.get(sid)
-        if session is None:
-            return
-        proxy, framer, _ = session
+    async def _handshake(self, body: bytes) -> None:
+        await self._fire(self._on_pair_request)  # a device is connecting → show the code
+        # v2: ephemeral×ephemeral ECDH (PFS) + host-screen-code binding. Sign our
+        # ephemeral so the device authenticates us against the pinned #hk key, and
+        # seal a canary probe under the code-bound key so the device can verify
+        # its code (and detect rotation) before any app traffic.
         try:
-            frame = framer.feed(body)
-        except Exception as exc:  # tampered/garbage ciphertext
-            logger.debug("secure relay frame rejected for %s: %s", sid, exc)
+            device_eph = json.loads(body).get("epub", "")
+            eph_h = EphemeralKey.generate()
+            shared = eph_h.shared_secret(device_eph)
+            info = session_info(self._identity.public_b64, device_eph, eph_h.public_b64)
+            channel = derive_session_key(shared, self._code, info=info)
+        except Exception as exc:  # bad/forged hello — drop
+            logger.debug("secure session hello rejected: %s", exc)
             return
-        await proxy.handle_message(frame)
-
-    async def _close(self, sid: str) -> None:
-        session = self._sessions.pop(sid, None)
-        if session is not None:
-            await session[0].stop()
+        nonce = secrets.token_hex(8)
+        response = json.dumps(
+            {
+                "v": 2,
+                "epub": eph_h.public_b64,
+                "sig": self._identity.sign(_b64u_decode(eph_h.public_b64)),
+                "nonce": nonce,
+                "probe": channel.seal_b64(PROBE_PREFIX + nonce.encode()),
+            }
+        )
+        await self._send(KIND_RESPONSE + response.encode("utf-8"))
+        self._framer = SecureFramer(_AppLink(self._send), channel)
+        self._proxy = DataChannelProxy(self._framer, local_base=self._local_base, forwarded_via=self._forwarded_via)
+        await self._proxy.start()
+        logger.debug("secure session established (v2)")
 
     async def stop(self) -> None:
-        for proxy, _, _ in list(self._sessions.values()):
-            await proxy.stop()
+        if self._proxy is not None:
+            await self._proxy.stop()
+            self._proxy = None
+
+
+class SecureRelayHost:
+    """Multiplex many :class:`SecureProxySession` over one relay link, keyed by
+    the per-browser session id (``sid``).  Inbound frames are ``sid || kind ||
+    body``; the sid is stripped before the session sees ``kind || body``.
+    """
+
+    def __init__(
+        self,
+        send: LinkSend,
+        identity: HostIdentity,
+        *,
+        local_base: str,
+        code: str,
+        forwarded_via: str = "proxy",
+        on_pair_request: Callable[[], Awaitable[None]] | None = None,
+        on_connected: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self._send = send
+        self._identity = identity
+        self._local_base = local_base
+        self._code = code
+        self._forwarded_via = forwarded_via
+        self._on_pair_request = on_pair_request
+        self._on_connected = on_connected
+        self._sessions: dict[str, SecureProxySession] = {}
+
+    async def feed(self, frame: bytes) -> None:
+        if len(frame) < SID_LEN + 1:
+            return
+        sid_bytes = frame[:SID_LEN]
+        sid = sid_bytes.decode("ascii", "replace")
+        rest = frame[SID_LEN:]  # kind || body
+        session = self._sessions.get(sid)
+        if session is None:
+            session = SecureProxySession(
+                _make_sid_send(self._send, sid_bytes),
+                self._identity,
+                local_base=self._local_base,
+                code=self._code,
+                forwarded_via=self._forwarded_via,
+                on_pair_request=self._on_pair_request,
+                on_connected=self._on_connected,
+            )
+            self._sessions[sid] = session
+        await session.feed(rest)
+        if rest[:1] == KIND_CLOSE:
+            self._sessions.pop(sid, None)
+
+    async def stop(self) -> None:
+        for session in list(self._sessions.values()):
+            await session.stop()
         self._sessions.clear()
 
     @property
     def active_sessions(self) -> list[str]:
-        return list(self._sessions)
+        return [sid for sid, s in self._sessions.items() if s.established]
+
+
+def _make_sid_send(send: LinkSend, sid: bytes) -> LinkSend:
+    async def _send(frame: bytes) -> None:
+        await send(sid + frame)
+
+    return _send
 
 
 async def run_secure_relay_host(
@@ -151,28 +250,39 @@ async def run_secure_relay_host(
     *,
     identity: HostIdentity,
     local_base: str,
+    code: str,
+    connection_key: str = "",
     forwarded_via: str = "proxy",
+    on_pair_request: Callable[[], Awaitable[None]] | None = None,
+    on_connected: Callable[[], Awaitable[None]] | None = None,
     reconnect: bool = True,
     reconnect_delay: float = 2.0,
 ) -> None:
     """Connect a :class:`SecureRelayHost` to the hub's blind relay over a WebSocket.
 
-    ``relay_ws_url`` is the host endpoint, e.g.
-    ``wss://hub.openhort.ai/securerelay/{host_id}/host?key=<connection_key>``.
-    Runs until cancelled, reconnecting on transient drops so a phone can attach
-    at any time.
+    ``relay_ws_url`` is the bare host endpoint, e.g.
+    ``wss://hub.openhort.ai/securerelay/{host_id}/r/{room}/host``. Pass
+    ``connection_key`` separately: it is sent as the ``X-OpenHort-Connection-Key``
+    header so it never lands in URLs or access logs (the hub still accepts a
+    legacy ``?key=`` for hosts that embed it in the URL). Runs until cancelled,
+    reconnecting on transient drops so a phone can attach at any time.
     """
 
     import websockets
 
+    headers = {"X-OpenHort-Connection-Key": connection_key} if connection_key else {}
+
     while True:
         try:
-            async with websockets.connect(relay_ws_url, max_size=None) as ws:
+            async with websockets.connect(relay_ws_url, max_size=None, additional_headers=headers) as ws:
 
                 async def _send(frame: bytes) -> None:
                     await ws.send(frame)
 
-                host = SecureRelayHost(_send, identity, local_base=local_base, forwarded_via=forwarded_via)
+                host = SecureRelayHost(
+                    _send, identity, local_base=local_base, code=code, forwarded_via=forwarded_via,
+                    on_pair_request=on_pair_request, on_connected=on_connected,
+                )
                 logger.debug("secure relay host connected")
                 try:
                     async for message in ws:
