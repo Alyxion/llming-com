@@ -66,4 +66,6 @@ nav:
   - Home: index.md
   - P2P:
     - Connectivity: p2p/connectivity.md
+    - Secure Pairing: p2p/secure-pairing.md
+    - Bandwidth Quotas: p2p/bandwidth-quotas.md
     - Workflow: p2p/workflow.md
