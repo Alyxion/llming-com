@@ -5,7 +5,17 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI, Request
 
-from llming_com import EphemeralKey, HostIdentity, SecureChannel, fingerprint
+from llming_com import (
+    EphemeralKey,
+    HostIdentity,
+    SecureChannel,
+    derive_session_key,
+    fingerprint,
+    generate_pairing_code,
+    normalize_code,
+    session_info,
+    verify_signature,
+)
 from llming_com.secure import _b64u_decode, _b64u_encode
 
 
@@ -92,6 +102,68 @@ def test_seal_b64_helpers() -> None:
     token = chan.seal_b64(b"json-frame", aad=b"v1")
     assert isinstance(token, str)
     assert chan.open_b64(token, aad=b"v1") == b"json-frame"
+
+
+# ---- v2: signed ephemerals + host-screen code binding ----
+
+
+def test_host_signs_ephemeral_and_browser_verifies() -> None:
+    host = HostIdentity.generate()
+    eph_h = EphemeralKey.generate()
+    sig = host.sign(_b64u_decode(eph_h.public_b64))
+    assert verify_signature(host.public_b64, _b64u_decode(eph_h.public_b64), sig)
+    # a different identity must not verify, and a tampered message must not verify
+    other = HostIdentity.generate()
+    assert not verify_signature(other.public_b64, _b64u_decode(eph_h.public_b64), sig)
+    assert not verify_signature(host.public_b64, b"tampered", sig)
+
+
+def test_pairing_code_is_high_entropy_and_normalizes() -> None:
+    c1, c2 = generate_pairing_code(), generate_pairing_code()
+    assert c1 != c2
+    assert "-" in c1  # grouped for readability
+    # dashes / spaces / case are ignored on input
+    assert normalize_code(c1.lower().replace("-", " ")) == normalize_code(c1)
+    assert len(normalize_code(c1)) >= 24  # 128-bit base32 ≈ 26 chars
+
+
+def test_v2_both_sides_agree_only_with_matching_code() -> None:
+    host = HostIdentity.generate()
+    eph_h, eph_d = EphemeralKey.generate(), EphemeralKey.generate()
+    code = generate_pairing_code()
+    info = session_info(host.public_b64, eph_d.public_b64, eph_h.public_b64)
+
+    host_chan = derive_session_key(eph_h.shared_secret(eph_d.public_b64), code, info=info)
+    dev_chan = derive_session_key(eph_d.shared_secret(eph_h.public_b64), code, info=info)
+    sealed = dev_chan.seal(b"top secret over the channel")
+    assert host_chan.open(sealed) == b"top secret over the channel"
+
+
+def test_v2_wrong_code_cannot_decrypt() -> None:
+    """A relay with the full ECDH transcript but the WRONG code is locked out."""
+    host = HostIdentity.generate()
+    eph_h, eph_d = EphemeralKey.generate(), EphemeralKey.generate()
+    info = session_info(host.public_b64, eph_d.public_b64, eph_h.public_b64)
+
+    dev_chan = derive_session_key(eph_d.shared_secret(eph_h.public_b64), generate_pairing_code(), info=info)
+    sealed = dev_chan.seal(b"secret")
+    # same ECDH secret, but a different host-screen code → cannot open
+    attacker = derive_session_key(eph_h.shared_secret(eph_d.public_b64), generate_pairing_code(), info=info)
+    with pytest.raises(Exception):
+        attacker.open(sealed)
+
+
+def test_v2_transcript_binding_detects_key_substitution() -> None:
+    """Different info (substituted ephemeral) yields a different key."""
+    host = HostIdentity.generate()
+    eph_h, eph_d, evil = EphemeralKey.generate(), EphemeralKey.generate(), EphemeralKey.generate()
+    code = generate_pairing_code()
+    shared = eph_d.shared_secret(eph_h.public_b64)
+    good = derive_session_key(shared, code, info=session_info(host.public_b64, eph_d.public_b64, eph_h.public_b64))
+    bad = derive_session_key(shared, code, info=session_info(host.public_b64, evil.public_b64, eph_h.public_b64))
+    sealed = good.seal(b"x")
+    with pytest.raises(Exception):
+        bad.open(sealed)
 
 
 def test_secure_framer_roundtrips_str_and_bytes() -> None:

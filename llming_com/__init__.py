@@ -82,9 +82,20 @@ from llming_com.p2p.host import (
 )
 from llming_com.p2p.webrtc import WebRTCPeer, WebRTCPeerRegistry
 from llming_com.p2p.relay_host import RelayHost
-from llming_com.p2p.secure_relay import SecureRelayHost, run_secure_relay_host
+from llming_com.p2p.secure_relay import SecureProxySession, SecureRelayHost, run_secure_relay_host
 from llming_com.publish import DeviceGrant, PublishedApp, PublishRegistry
-from llming_com.secure import EphemeralKey, HostIdentity, SecureChannel, SecureFramer, fingerprint
+from llming_com.secure import (
+    EphemeralKey,
+    HostIdentity,
+    SecureChannel,
+    SecureFramer,
+    derive_session_key,
+    fingerprint,
+    generate_pairing_code,
+    normalize_code,
+    session_info,
+    verify_signature,
+)
 
 __all__ = [
     # Auth
@@ -152,6 +163,7 @@ __all__ = [
     "WebRTCPeerRegistry",
     "RelayHost",
     "SecureRelayHost",
+    "SecureProxySession",
     "run_secure_relay_host",
     # Named publishing (stable URLs, lifetime, durable reconnect)
     "PublishRegistry",
@@ -165,4 +177,9 @@ __all__ = [
     "SecureChannel",
     "SecureFramer",
     "fingerprint",
+    "verify_signature",
+    "generate_pairing_code",
+    "normalize_code",
+    "session_info",
+    "derive_session_key",
 ]

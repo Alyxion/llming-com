@@ -13,7 +13,17 @@ from typing import Any
 import pytest
 from fastapi import FastAPI, Request
 
-from llming_com import RelayHost
+from llming_com import (
+    EphemeralKey,
+    HostIdentity,
+    RelayHost,
+    derive_session_key,
+    generate_pairing_code,
+    session_info,
+    verify_signature,
+)
+from llming_com.p2p.secure_relay import KIND_APP, KIND_HELLO, PROBE_PREFIX
+from llming_com.secure import _b64u_decode
 
 aiortc = pytest.importorskip("aiortc")
 
@@ -80,7 +90,10 @@ def _app() -> FastAPI:
 async def test_resolve_ice_servers_prefers_static_list() -> None:
     fake = _FakeAdmission()
     turn = [{"urls": ["turn:turn.example:3478"], "username": "u", "credential": "c"}]
-    host = RelayHost("room-x", local_base="http://127.0.0.1:1", admission=fake, ice_servers=turn)
+    host = RelayHost(
+        "room-x", local_base="http://127.0.0.1:1", identity=HostIdentity.generate(), code="C",
+        admission=fake, ice_servers=turn,
+    )
     assert await host._resolve_ice_servers() == turn
 
 
@@ -123,15 +136,21 @@ async def test_relay_host_answers_offer_and_proxies_http() -> None:
     server.start()
 
     fake = _FakeAdmission()
+    identity = HostIdentity.generate()
+    code = generate_pairing_code()
     host = RelayHost(
         "room-1",
         local_base=f"http://127.0.0.1:{port}",
+        identity=identity,
+        code=code,
         admission=fake,
         stun_servers=[],            # localhost: host-only ICE
         sdp_poll_interval=0.05,
     )
+    # Browser side: ephemeral + the v2 secure-session handshake over the channel.
+    device = EphemeralKey.generate()
     pc = aiortc.RTCPeerConnection()
-    received: asyncio.Queue[str] = asyncio.Queue()
+    inbound: asyncio.Queue[bytes] = asyncio.Queue()
     try:
         await host.start()
         assert fake.registered
@@ -139,8 +158,8 @@ async def test_relay_host_answers_offer_and_proxies_http() -> None:
         channel = pc.createDataChannel("llming")
 
         @channel.on("message")
-        def _on_message(message: str) -> None:
-            received.put_nowait(message)
+        def _on_message(message: bytes) -> None:
+            inbound.put_nowait(message if isinstance(message, bytes) else message.encode("latin-1"))
 
         await pc.setLocalDescription(await pc.createOffer())
         if pc.iceGatheringState != "complete":
@@ -153,28 +172,40 @@ async def test_relay_host_answers_offer_and_proxies_http() -> None:
 
             await asyncio.wait_for(done.wait(), timeout=5)
 
-        # hand the offer to the relay inbox; RelayHost polls, answers via outbox
         fake.inbox.append({"type": "offer", "sdp": pc.localDescription.sdp})
         deadline = asyncio.get_running_loop().time() + 8
         while not fake.outbox and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.05)
         assert fake.outbox, "relay host did not answer the offer"
-        answer = fake.outbox[0]
-        assert answer["type"] == "answer"
-        await pc.setRemoteDescription(aiortc.RTCSessionDescription(sdp=answer["sdp"], type="answer"))
+        await pc.setRemoteDescription(aiortc.RTCSessionDescription(sdp=fake.outbox[0]["sdp"], type="answer"))
 
         deadline = asyncio.get_running_loop().time() + 8
         while channel.readyState != "open" and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.05)
         assert channel.readyState == "open"
 
-        channel.send(json.dumps({"id": "r1", "type": "http", "method": "GET", "path": "/hello", "headers": {}, "body": ""}))
-        item = await asyncio.wait_for(received.get(), timeout=8)
-        payload = json.loads(item)
+        # 1) hello → host answers with a signed ephemeral + canary probe
+        channel.send(KIND_HELLO + json.dumps({"epub": device.public_b64}).encode())
+        resp = json.loads((await asyncio.wait_for(inbound.get(), timeout=8))[1:])  # strip 'R'
+        assert verify_signature(identity.public_b64, _b64u_decode(resp["epub"]), resp["sig"])
+
+        # 2) derive the code-bound key and confirm the probe (wrong code would fail)
+        info = session_info(identity.public_b64, device.public_b64, resp["epub"])
+        chan = derive_session_key(device.shared_secret(resp["epub"]), code, info=info)
+        assert chan.open_b64(resp["probe"]) == PROBE_PREFIX + resp["nonce"].encode()
+
+        # 3) HTTP over the now-encrypted, code-bound DataChannel
+        req = json.dumps({"id": "r1", "type": "http", "method": "GET", "path": "/hello", "headers": {}, "body": ""})
+        channel.send(KIND_APP + chan.seal(b"J" + req.encode()))
+        frame = await asyncio.wait_for(inbound.get(), timeout=8)
+        assert frame[:1] == KIND_APP
+        opened = chan.open(frame[1:])
+        assert opened[:1] == b"J"
+        payload = json.loads(opened[1:])
         assert payload["status"] == 200
         body = json.loads(payload["body"])
         assert body["msg"] == "hi"
-        assert body["via"] == "p2p"   # DataChannelProxy tags the forwarded request
+        assert body["via"] == "p2p"
     finally:
         await host.stop()
         await pc.close()

@@ -32,17 +32,22 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import secrets as _secrets
 from dataclasses import dataclass
 from typing import Any
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 _CURVE = ec.SECP256R1()
 _HKDF_INFO = b"llming-com/e2e/v1 aes-256-gcm"
+_HKDF_INFO_V2 = b"llming-com/e2e/v2 aes-256-gcm"
 _NONCE_LEN = 12
+_PAIRING_CODE_BYTES = 16  # 128-bit host-screen code
 
 
 def _b64u_encode(raw: bytes) -> str:
@@ -138,11 +143,25 @@ class HostIdentity:
         return fingerprint(self.public_b64)
 
     def derive(self, peer_public_b64: str) -> SecureChannel:
-        """Derive the session key against the browser's ephemeral public key."""
+        """v1: derive a session key against a peer's ephemeral public key."""
 
         peer = ec.EllipticCurvePublicKey.from_encoded_point(_CURVE, _b64u_decode(peer_public_b64))
         shared = self._private.exchange(ec.ECDH(), peer)
         return _derive_channel(shared)
+
+    def sign(self, data: bytes) -> str:
+        """Sign with the long-term identity (ECDSA P-256/SHA-256) → base64url.
+
+        Returns the signature in raw **P1363** form (``r‖s``, 64 bytes) — the
+        format browser Web Crypto's ``verify`` expects — not DER.  Used to
+        authenticate a per-session ephemeral public key so a relay can't
+        substitute the host's key; the browser verifies against the pinned
+        identity (``#hk`` fingerprint).
+        """
+
+        der = self._private.sign(data, ec.ECDSA(hashes.SHA256()))
+        r, s = decode_dss_signature(der)
+        return _b64u_encode(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
 
 
 @dataclass(frozen=True)
@@ -160,9 +179,75 @@ class EphemeralKey:
         return _b64u_encode(_raw_public(self._private.public_key()))
 
     def derive(self, host_public_b64: str) -> SecureChannel:
+        """v1: derive a session key against the host's public key."""
+
         host = ec.EllipticCurvePublicKey.from_encoded_point(_CURVE, _b64u_decode(host_public_b64))
         shared = self._private.exchange(ec.ECDH(), host)
         return _derive_channel(shared)
+
+    def shared_secret(self, peer_public_b64: str) -> bytes:
+        """Raw ECDH shared secret (X-coordinate) with a peer's public key."""
+
+        peer = ec.EllipticCurvePublicKey.from_encoded_point(_CURVE, _b64u_decode(peer_public_b64))
+        return self._private.exchange(ec.ECDH(), peer)
+
+
+# ---------------------------------------------------------------------------
+# v2: forward-secret, host-screen-code-bound key agreement
+#
+# K = HKDF(IKM = ECDH(eph_a, eph_b), salt = SHA256(normalized code), info =
+#          host_pubkey || device_eph_pub || host_eph_pub)
+#
+# - ephemeral×ephemeral ECDH  → forward secrecy
+# - host ephemeral is signed by the pinned identity → host authentication
+# - the host-screen code in the salt → an untrusted relay (which never sees the
+#   code) cannot derive K or MITM, even with the full transcript.
+# ---------------------------------------------------------------------------
+
+
+def verify_signature(signer_public_b64: str, data: bytes, signature_b64: str) -> bool:
+    """Verify a raw **P1363** (``r‖s``) ECDSA P-256/SHA-256 signature."""
+
+    try:
+        raw = _b64u_decode(signature_b64)
+        if len(raw) != 64:
+            return False
+        der = encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big"))
+        key = ec.EllipticCurvePublicKey.from_encoded_point(_CURVE, _b64u_decode(signer_public_b64))
+        key.verify(der, data, ec.ECDSA(hashes.SHA256()))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def generate_pairing_code() -> str:
+    """A 128-bit host-screen code as grouped, copy-pastable base32 (no padding)."""
+
+    raw = _secrets.token_bytes(_PAIRING_CODE_BYTES)
+    b32 = base64.b32encode(raw).decode("ascii").rstrip("=")
+    return "-".join(b32[i : i + 4] for i in range(0, len(b32), 4))
+
+
+def normalize_code(code: str) -> bytes:
+    """Canonicalize a typed code so dashes / spaces / case don't matter."""
+
+    return "".join(ch for ch in code.upper() if ch.isalnum()).encode("ascii")
+
+
+def session_info(host_public_b64: str, device_eph_b64: str, host_eph_b64: str) -> bytes:
+    """Transcript binding for HKDF ``info`` — pins identity + both ephemerals."""
+
+    return b"|".join(p.encode("ascii") for p in (host_public_b64, device_eph_b64, host_eph_b64))
+
+
+def derive_session_key(shared_secret: bytes, code: str, *, info: bytes) -> SecureChannel:
+    """v2 key schedule: ECDH secret + host-screen code → AES-256-GCM channel."""
+
+    salt = hashlib.sha256(normalize_code(code)).digest()
+    key = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=_HKDF_INFO_V2 + b"\x00" + info).derive(
+        shared_secret
+    )
+    return SecureChannel(key)
 
 
 # 1-byte frame tags so a single sealed binary blob can carry either a JSON

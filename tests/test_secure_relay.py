@@ -19,8 +19,24 @@ import pytest
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 
-from llming_com import EphemeralKey, HostIdentity, SecureChannel, SecureRelayHost
-from llming_com.p2p.secure_relay import KIND_APP, KIND_HELLO, SID_LEN
+from llming_com import (
+    EphemeralKey,
+    HostIdentity,
+    SecureChannel,
+    SecureRelayHost,
+    derive_session_key,
+    generate_pairing_code,
+    session_info,
+    verify_signature,
+)
+from llming_com.p2p.secure_relay import (
+    KIND_APP,
+    KIND_HELLO,
+    KIND_RESPONSE,
+    PROBE_PREFIX,
+    SID_LEN,
+)
+from llming_com.secure import _b64u_decode
 
 
 def _app() -> FastAPI:
@@ -66,11 +82,16 @@ class _Server:
 
 
 class _BrowserSim:
-    """Minimal browser side: derives the session key and speaks the proxy protocol."""
+    """Minimal v2 browser side: verifies the signed host ephemeral, derives the
+    code-bound key, checks the probe, then speaks the proxy protocol."""
 
-    def __init__(self, host_pub_b64: str) -> None:
+    def __init__(self, host_pub_b64: str, code: str) -> None:
+        self._host_pub = host_pub_b64
+        self._code = code
         self._eph = EphemeralKey.generate()
-        self._chan: SecureChannel = self._eph.derive(host_pub_b64)
+        self._chan: SecureChannel | None = None
+        self.sig_ok: bool | None = None
+        self.probe_ok: bool | None = None
         self.to_relay: asyncio.Queue[bytes] = asyncio.Queue()   # browser -> relay (kind||body)
         self.inbox: list[dict] = []                              # decoded http responses
         self.ws_messages: asyncio.Queue[str] = asyncio.Queue()
@@ -93,7 +114,10 @@ class _BrowserSim:
     def on_relay_frame(self, frame: bytes) -> None:
         # frame = kind || body  (sid already stripped by the relay)
         kind, body = frame[:1], frame[1:]
-        if kind != KIND_APP:
+        if kind == KIND_RESPONSE:
+            self._handle_response(json.loads(body))
+            return
+        if kind != KIND_APP or self._chan is None:
             return
         plain = self._chan.open(body)
         tag, payload = plain[:1], plain[1:]
@@ -105,6 +129,23 @@ class _BrowserSim:
         elif msg.get("type") == "ws_text":
             self.ws_messages.put_nowait(msg["data"])
 
+    def _handle_response(self, resp: dict) -> None:
+        host_eph = resp["epub"]
+        # authenticate the host ephemeral against the pinned identity key
+        self.sig_ok = verify_signature(self._host_pub, _b64u_decode(host_eph), resp["sig"])
+        if not self.sig_ok:
+            return
+        shared = self._eph.shared_secret(host_eph)
+        info = session_info(self._host_pub, self._eph.public_b64, host_eph)
+        chan = derive_session_key(shared, self._code, info=info)
+        try:
+            opened = chan.open_b64(resp["probe"])
+            self.probe_ok = opened == PROBE_PREFIX + resp["nonce"].encode()
+        except Exception:
+            self.probe_ok = False
+        if self.probe_ok:
+            self._chan = chan  # code matched → channel established
+
 
 @pytest.mark.asyncio
 async def test_secure_relay_http_and_ws_end_to_end() -> None:
@@ -113,7 +154,8 @@ async def test_secure_relay_http_and_ws_end_to_end() -> None:
     server.start()
 
     identity = HostIdentity.generate()
-    browser = _BrowserSim(identity.public_b64)
+    code = generate_pairing_code()
+    browser = _BrowserSim(identity.public_b64, code)
     sid = b"sess000000000001"  # 16 bytes
 
     # In-memory blind relay: host->relay frames carry the sid; relay strips it to
@@ -123,12 +165,11 @@ async def test_secure_relay_http_and_ws_end_to_end() -> None:
         assert b"http_response" not in frame  # ciphertext only
         browser.on_relay_frame(frame[SID_LEN:])
 
-    host = SecureRelayHost(host_send, identity, local_base=f"http://127.0.0.1:{port}")
+    host = SecureRelayHost(host_send, identity, local_base=f"http://127.0.0.1:{port}", code=code)
 
     async def pump_browser_to_host() -> None:
         while True:
             kb = await browser.to_relay.get()
-            assert b"epub" in kb or b"http" not in kb  # only the hello is plaintext
             await host.feed(sid + kb)
 
     pump = asyncio.create_task(pump_browser_to_host())
@@ -136,6 +177,8 @@ async def test_secure_relay_http_and_ws_end_to_end() -> None:
         await browser.hello()
         await asyncio.sleep(0.05)
         assert host.active_sessions == ["sess000000000001"]
+        assert browser.sig_ok is True   # host ephemeral authenticated vs pinned key
+        assert browser.probe_ok is True  # code matched → channel established
 
         # --- HTTP over the encrypted relay ---
         await browser.send_http("r1", "/info")
@@ -160,24 +203,40 @@ async def test_secure_relay_http_and_ws_end_to_end() -> None:
 
 
 @pytest.mark.asyncio
-async def test_secure_relay_rejects_forged_host_key() -> None:
-    """A relay/attacker that doesn't hold the host private key can't open a session."""
+async def test_secure_relay_wrong_code_is_locked_out() -> None:
+    """A client (or relay) with the wrong host-screen code can't pass the probe."""
     identity = HostIdentity.generate()
-    wrong = HostIdentity.generate()
-    browser = _BrowserSim(wrong.public_b64)  # browser was given a forged host key
+    browser = _BrowserSim(identity.public_b64, generate_pairing_code())  # wrong code
 
-    sent: list[bytes] = []
+    sid = b"sess000000000002"
 
     async def host_send(frame: bytes) -> None:
-        sent.append(frame)
+        browser.on_relay_frame(frame[SID_LEN:])
 
-    host = SecureRelayHost(host_send, identity, local_base="http://127.0.0.1:1")
-    sid = b"sess000000000002"
+    host = SecureRelayHost(host_send, identity, local_base="http://127.0.0.1:1", code=generate_pairing_code())
+    await browser.hello()
+    await host.feed(sid + await browser.to_relay.get())  # → host sends signed response + probe
+    await asyncio.sleep(0.05)
+    assert browser.sig_ok is True    # host is authentic (signature verifies)...
+    assert browser.probe_ok is False  # ...but the wrong code can't open the probe → no channel
+
+
+@pytest.mark.asyncio
+async def test_secure_relay_rejects_forged_host_key() -> None:
+    """A relay that substitutes the host identity fails signature verification."""
+    identity = HostIdentity.generate()
+    wrong = HostIdentity.generate()
+    code = generate_pairing_code()
+    browser = _BrowserSim(wrong.public_b64, code)  # browser pinned a DIFFERENT key (#hk)
+
+    sid = b"sess000000000003"
+
+    async def host_send(frame: bytes) -> None:
+        browser.on_relay_frame(frame[SID_LEN:])
+
+    host = SecureRelayHost(host_send, identity, local_base="http://127.0.0.1:1", code=code)
     await browser.hello()
     await host.feed(sid + await browser.to_relay.get())
-    # Session opens (hello carries a valid pubkey), but the derived keys differ,
-    # so the first sealed app frame fails to open and is dropped — no app traffic.
-    await browser.send_http("r1", "/info")
-    await host.feed(sid + await browser.to_relay.get())
     await asyncio.sleep(0.05)
-    assert sent == []  # nothing proxied; the forged-key client can't talk
+    assert browser.sig_ok is False  # signature doesn't match the pinned key → abort
+    assert browser.probe_ok is None  # never even tried to derive a key
