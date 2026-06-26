@@ -34,15 +34,32 @@ websockets = ">=12"
 cryptography = ">=42"
 mcp = {version = ">=1.0", optional = true}
 aiortc = {version = ">=1.13", optional = true}
+# --- Courier subpackage (llming_com.courier) optional deps -------------------
+# Core courier import (crypto/url/models/client) needs only pydantic +
+# cryptography (already required above). The service/server/Azure paths add:
+pydantic-settings = {version = ">=2.7,<3.0", optional = true}
+uvicorn = {version = ">=0.34,<1.0", extras = ["standard"], optional = true}
+python-multipart = {version = ">=0.0.18,<1.0", optional = true}
+azure-storage-blob = {version = ">=12.24,<13.0", optional = true}
+azure-identity = {version = ">=1.19,<2.0", optional = true}
 
 [tool.poetry.extras]
 mcp = ["mcp"]
 webrtc = ["aiortc"]
+# Courier: in-memory service + ExchangeService (e.g. embedding the courier).
+courier = ["pydantic-settings"]
+# Courier dev/upload server (FastAPI app factory). fastapi is already core.
+courier-server = ["pydantic-settings", "uvicorn", "python-multipart"]
+# Courier production Azure Blob backend + Function host.
+courier-azure = ["pydantic-settings", "azure-storage-blob", "azure-identity"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0"
 pytest-asyncio = ">=0.23"
 mcp = ">=1.0"
+# Courier test suite (tests/courier) exercises the service + FastAPI server.
+pydantic-settings = ">=2.7,<3.0"
+python-multipart = ">=0.0.18,<1.0"
 
 [tool.poetry.group.docs.dependencies]
 mkdocs-material = "^9.7.6"

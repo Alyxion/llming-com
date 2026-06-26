@@ -34,6 +34,63 @@ Two surfaces, two router types -- pick by audience, not by preference:
 
 Do not add HTTP routes for UI commands -- those belong on `SessionRouter` or `AppRouter`. Do not push large blobs through the WS message pipe -- those belong on plain HTTP endpoints. The `@command` framework is for the debug/admin surface; it is not a UI command system.
 
+## Courier -- out-of-band byte transfer (`llming_com.courier`)
+
+The "large or static content" HTTP lane has a first-class implementation: the
+**Courier** subpackage, a payload-agnostic side channel for handing arbitrary
+bytes between MCP servers (or any producer/consumer) **without the bytes ever
+passing through the model's context window**. Object storage carries the
+payload; a short capability URL is the only thing that moves -- *the model
+moves the URL; the storage moves the bytes.*
+
+```python
+from llming_com.courier import CourierClient
+
+client = CourierClient("https://courier.example", api_key="dev-key")  # host root
+url = client.upload(pdf_bytes, content_type="application/pdf")  # POST /courier/upload, AES-256-GCM
+data = client.download(url)                                     # GET /courier/o/{id} + decrypt + verify
+```
+
+All routes are served under `/courier` (`/courier/upload`, `/courier/o/{id}`,
+`/courier/healthz`) so the Courier can be mounted alongside the rest of an
+llming-com app. Embed it into an existing FastAPI app with
+`app.include_router(build_router(service, settings))` from
+`llming_com.courier.server.app`.
+
+- **Lean core** -- importing the client/crypto/URL surface needs only `pydantic`
+  + `cryptography` (already core here). The service/server/Azure paths are
+  guarded behind extras so the framework stays unaffected.
+- **Independently deployable** -- ships its own Azure Functions host. The build
+  vendors *only* `llming_com.courier` (under a stub `llming_com` namespace) so
+  the Function never pulls in the FastAPI/WebSocket/P2P framework.
+- **Self-contained config** -- every deployment variable lives in
+  [`deploy/courier/.env.example`](deploy/courier/.env.example); nothing
+  infrastructure-identifying is committed.
+
+Install the bits you need:
+
+```bash
+poetry install --extras courier-server   # local dev/upload FastAPI server
+poetry install --extras courier-azure     # production Azure Blob backend + Function host
+```
+
+Run the local server and deploy to Azure:
+
+```bash
+# local dev server
+export COURIER_API_KEYS="dev-key"
+poetry run uvicorn llming_com.courier.server.app:create_app --factory --reload
+
+# build + deploy the Azure Function (see docs/courier/DEPLOYMENT.md)
+bash deploy/courier/azure/build.sh
+```
+
+Reference docs: [`docs/courier/`](docs/courier/) --
+[SECURITY](docs/courier/SECURITY.md) (the spec),
+[CONFIGURATION](docs/courier/CONFIGURATION.md) (every `COURIER_*` var),
+[DEPLOYMENT](docs/courier/DEPLOYMENT.md),
+[INFRASTRUCTURE](docs/courier/INFRASTRUCTURE.md).
+
 ## Shared P2P And Proxy Transport
 
 `llming-com` is the canonical home for shared transport primitives used by
@@ -123,11 +180,13 @@ llming_com/           Core library (auth, session, transport, commands, debug, d
 llming_com/access/    Remote access tunnel primitives
 llming_com/mcp/       MCP HTTP/SSE and stdio transports
 llming_com/p2p/       P2P admission, DataChannel proxy, WebRTC peer, FastAPI signaling host
+llming_com/courier/   Out-of-band byte transfer: crypto, capability URLs, storage backends, dev server
 llming_com/static/    JavaScript client and generic P2P viewer assets
 llming_com/server/p2p/ Server-side P2P relay assets and deployment backends
-tests/                Pytest suite
+deploy/courier/       Azure Functions host + .env.example for the Courier
+tests/                Pytest suite (tests/courier/ covers the Courier)
 samples/              Example applications (run with: LLMING_AUTH_SECRET=demo python samples/demo_app.py)
-docs/                 Documentation and assets
+docs/                 Documentation and assets (docs/courier/ for the Courier spec/runbooks)
 ```
 
 ## Documentation

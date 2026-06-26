@@ -1,0 +1,10 @@
+# Azure Functions host dependencies (third-party only).
+# The llming_com.courier subpackage itself is vendored into the deployment
+# package by build.sh (under a stub llming_com namespace), so it must NOT be
+# listed here. The full llming-com framework is intentionally not installed.
+azure-functions>=1.21,<2.0
+azure-identity>=1.19,<2.0
+azure-storage-blob>=12.24,<13.0
+pydantic>=2.11,<3.0
+pydantic-settings>=2.7,<3.0
+cryptography>=44.0,<46.0

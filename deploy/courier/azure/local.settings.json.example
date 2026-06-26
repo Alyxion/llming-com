@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to local.settings.json (gitignored). Fill with NON-committed values. Replace every <placeholder> with your own infrastructure details — never commit real account names, URLs, or keys.",
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "<functions-runtime-storage-connection-string>",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "COURIER_ACCOUNT_URL": "https://<your-account>.blob.core.windows.net",
+    "COURIER_CONTAINER": "exchange",
+    "_comment_base_url": "Host root only — routes are served under the 'courier' prefix (host.json) and download URLs add 'courier/o', so do NOT append /api or /courier here.",
+    "COURIER_PUBLIC_BASE_URL": "https://<your-function-app>.azurewebsites.net",
+    "COURIER_API_KEYS": "<upload-key-1>,<upload-key-2>",
+    "COURIER_SIGNING_KEY": "<random-32+-byte-secret>",
+    "COURIER_DEFAULT_SINGLE_USE": "false"
+  }
+}
