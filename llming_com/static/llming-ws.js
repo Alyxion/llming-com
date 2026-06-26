@@ -69,11 +69,29 @@ class LlmingWebSocket {
     this.ws = null;
     this._heartbeatTimer   = null;
     this._ackTimer         = null;
+    this._livenessTimer    = null;
     this._ackWarningShown  = false;
     this._reconnectAttempts = 0;
     this._reconnectTimer   = null;
     this._intentionalClose = false;
     this._everConnected    = false;
+    this._awaitingAck      = false;
+    this._missedAcks       = 0;
+
+    // Recover "zombie" sockets. A backgrounded tab can have its connection
+    // silently dropped by a proxy/server with NO 'onclose' event — the socket
+    // stays readyState OPEN forever, heartbeats go nowhere, and the session
+    // looks dead (no model selection, no reply) with no error. When the tab
+    // returns to the foreground / regains focus / network comes back, actively
+    // verify liveness instead of waiting forever.
+    if (typeof document !== 'undefined' && typeof window !== 'undefined') {
+      const wake = () => this._checkLiveness();
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') wake();
+      });
+      window.addEventListener('online', wake);
+      window.addEventListener('focus', wake);
+    }
   }
 
   /** Open the WebSocket connection.  Safe to call again after close(). */
@@ -89,6 +107,8 @@ class LlmingWebSocket {
       const wasReconnect = this._reconnectAttempts > 0;
       this._reconnectAttempts = 0;
       this._everConnected = true;
+      this._awaitingAck = false;
+      this._missedAcks = 0;
       this._hideBanner();
       this._ackWarningShown = false;
       this._startHeartbeat();
@@ -191,7 +211,21 @@ class LlmingWebSocket {
 
   _startHeartbeat() {
     if (!this._heartbeatIntervalMs) return;
+    this._awaitingAck = false;
+    this._missedAcks = 0;
     this._heartbeatTimer = setInterval(() => {
+      // The previous heartbeat was never acked — the socket is likely dead even
+      // though the browser still reports it OPEN. After two misses (~2 intervals)
+      // force a reconnect instead of warning forever.
+      if (this._awaitingAck) {
+        this._missedAcks++;
+        if (this._missedAcks >= 2) {
+          console.warn(`[LlmingWS] Heartbeat dead (${this._missedAcks} misses) — forcing reconnect`);
+          this._forceReconnect();
+          return;
+        }
+      }
+      this._awaitingAck = true;
       this.send({ type: 'heartbeat' });
       this._startAckTimeout();
     }, this._heartbeatIntervalMs);
@@ -204,6 +238,52 @@ class LlmingWebSocket {
     }
     clearTimeout(this._ackTimer);
     this._ackTimer = null;
+    clearTimeout(this._livenessTimer);
+    this._livenessTimer = null;
+  }
+
+  /** Break a half-dead ("zombie") socket so the reconnect path engages. */
+  _forceReconnect() {
+    if (this._intentionalClose) return;
+    this._stopHeartbeat();
+    this._awaitingAck = false;
+    this._missedAcks = 0;
+    const sock = this.ws;
+    try {
+      if (sock) sock.close();
+    } catch (_) { /* ignore */ }
+    // If the socket was already CLOSED, no 'onclose' will fire — reconnect now.
+    if (!sock || sock.readyState === WebSocket.CLOSED) {
+      if (this._reconnectAttempts < this._maxReconnectAttempts) {
+        this._reconnectAttempts++;
+        this._reconnectTimer = setTimeout(() => this.connect(), 250);
+      } else if (this._onSessionLost) {
+        this._onSessionLost({ reason: 'exhausted' });
+      }
+    }
+  }
+
+  /** Verify the socket is really alive (tab returned to foreground / network
+   *  back). Reconnect if dropped, or ping-and-watch if it claims to be OPEN. */
+  _checkLiveness() {
+    if (this._offline || this._intentionalClose) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // Dropped (often while backgrounded). Reconnect promptly.
+      clearTimeout(this._reconnectTimer);
+      this._reconnectAttempts = 0;
+      this.connect();
+      return;
+    }
+    // Claims OPEN — confirm with an immediate heartbeat + short watchdog.
+    this._awaitingAck = true;
+    this.send({ type: 'heartbeat' });
+    clearTimeout(this._livenessTimer);
+    this._livenessTimer = setTimeout(() => {
+      if (this._awaitingAck && this.ws && this.ws.readyState === WebSocket.OPEN) {
+        console.warn('[LlmingWS] Liveness check failed — forcing reconnect');
+        this._forceReconnect();
+      }
+    }, 5000);
   }
 
   _startAckTimeout() {
@@ -221,6 +301,10 @@ class LlmingWebSocket {
   _onHeartbeatAck() {
     clearTimeout(this._ackTimer);
     this._ackTimer = null;
+    clearTimeout(this._livenessTimer);
+    this._livenessTimer = null;
+    this._awaitingAck = false;
+    this._missedAcks = 0;
     if (this._ackWarningShown) {
       this._ackWarningShown = false;
       this._hideBanner();
